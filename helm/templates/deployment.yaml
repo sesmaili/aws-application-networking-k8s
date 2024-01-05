@@ -39,6 +39,8 @@ spec:
         - name: {{ . }}
       {{- end }}
       {{- end }}
+      securityContext:
+        runAsNonRoot: true
       containers:
       - command:
         - /manager
@@ -66,23 +68,25 @@ spec:
           periodSeconds: 10
         securityContext:
           allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
         env:
           - name: REGION
-            valueFrom:
-              configMapKeyRef:
-                name: env-config
-                key: awsRegion
+            value: {{ .Values.awsRegion | quote }}
           - name: AWS_ACCOUNT_ID
-            valueFrom:
-              configMapKeyRef:
-                name: env-config
-                key: awsAccountId
+            value: {{ .Values.awsAccountId | quote }}
           - name: CLUSTER_VPC_ID
-            valueFrom:
-              configMapKeyRef:
-                name: env-config
-                key: clusterVpcId
-
+            value: {{ .Values.clusterVpcId | quote }}
+          - name: CLUSTER_NAME
+            value: {{ .Values.clusterName | quote }}
+          - name: LATTICE_ENDPOINT
+            value: {{ .Values.latticeEndpoint | quote }}
+          - name: DEFAULT_SERVICE_NETWORK
+            value: {{ .Values.defaultServiceNetwork | quote }}
+          - name: LOG_LEVEL
+            value: {{ .Values.log.level | quote }}
       terminationGracePeriodSeconds: 10
       nodeSelector: {{ toYaml .Values.deployment.nodeSelector | nindent 8 }}
       {{ if .Values.deployment.tolerations -}}

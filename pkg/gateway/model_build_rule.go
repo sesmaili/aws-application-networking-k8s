@@ -5,197 +5,275 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/golang/glog"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+
+	anv1alpha1 "github.com/aws/aws-application-networking-k8s/pkg/apis/applicationnetworking/v1alpha1"
+	"github.com/aws/aws-application-networking-k8s/pkg/model/core"
 
 	"github.com/aws/aws-sdk-go/aws"
 
-	gateway_api "sigs.k8s.io/gateway-api/apis/v1beta1"
-
-	latticemodel "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
 	"github.com/aws/aws-sdk-go/service/vpclattice"
+	gwv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
+
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	model "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
 )
 
 const (
-	resourceIDRuleConfig = "RuleConfig"
-	// error code
 	LATTICE_NO_SUPPORT_FOR_MULTIPLE_MATCHES = "LATTICE_NO_SUPPORT_FOR_MULTIPLE_MATCHES"
-
-	LATTICE_EXCEED_MAX_HEADER_MATCHES = "LATTICE_EXCEED_MAX_HEADER_MATCHES"
-
-	LATTICE_UNSUPPORTED_MATCH_TYPE = "LATTICE_UNSUPPORTED_MATCH_TYPE"
-
-	LATTICE_UNSUPPORTED_HEADER_MATCH_TYPE = "LATTICE_UNSUPPORTED_HEADER_MATCH_TYPE"
-
-	LATTICE_UNSUPPORTED_PATH_MATCH_TYPE = "LATTICE_UNSUPPORTED_PATH_MATCH_TYPE"
-
-	LATTICE_MAX_HEADER_MATCHES = 5
+	LATTICE_EXCEED_MAX_HEADER_MATCHES       = "LATTICE_EXCEED_MAX_HEADER_MATCHES"
+	LATTICE_UNSUPPORTED_MATCH_TYPE          = "LATTICE_UNSUPPORTED_MATCH_TYPE"
+	LATTICE_UNSUPPORTED_HEADER_MATCH_TYPE   = "LATTICE_UNSUPPORTED_HEADER_MATCH_TYPE"
+	LATTICE_UNSUPPORTED_PATH_MATCH_TYPE     = "LATTICE_UNSUPPORTED_PATH_MATCH_TYPE"
+	LATTICE_MAX_HEADER_MATCHES              = 5
 )
 
-func (t *latticeServiceModelBuildTask) buildRules(ctx context.Context) error {
+func (t *latticeServiceModelBuildTask) buildRules(ctx context.Context, stackListenerId string) error {
+	// note we only build rules for non-deleted routes
+	t.log.Debugf("Processing %d rules", len(t.route.Spec().Rules()))
 
-	var ruleID = 1
-	for _, parentRef := range t.httpRoute.Spec.ParentRefs {
-		if parentRef.Name != t.httpRoute.Spec.ParentRefs[0].Name {
-			// when a service is associate to multiple service network(s), all listener config MUST be same
-			// so here we are only using the 1st gateway
-			glog.V(2).Infof("Ignore parentref of different gateway %v", parentRef.Name)
-
-			continue
+	for i, rule := range t.route.Spec().Rules() {
+		ruleSpec := model.RuleSpec{
+			StackListenerId: stackListenerId,
+			Priority:        int64(i + 1),
 		}
-		port, protocol, _, err := t.extractListnerInfo(ctx, parentRef)
 
+		if len(rule.Matches()) > 1 {
+			// only support 1 match today
+			return errors.New(LATTICE_NO_SUPPORT_FOR_MULTIPLE_MATCHES)
+		} else if len(rule.Matches()) > 0 {
+			t.log.Debugf("Processing rule match")
+			match := rule.Matches()[0]
+
+			switch m := match.(type) {
+			case *core.HTTPRouteMatch:
+				if err := t.updateRuleSpecForHttpRoute(m, &ruleSpec); err != nil {
+					return err
+				}
+			case *core.GRPCRouteMatch:
+				if err := t.updateRuleSpecForGrpcRoute(m, &ruleSpec); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("unsupported rule match: %T", m)
+			}
+
+			if err := t.updateRuleSpecWithHeaderMatches(match, &ruleSpec); err != nil {
+				return err
+			}
+		} else {
+			// Match every traffic on no matches
+			ruleSpec.PathMatchValue = "/"
+			ruleSpec.PathMatchPrefix = true
+			if _, ok := rule.(*core.GRPCRouteRule); ok {
+				ruleSpec.Method = string(gwv1.HTTPMethodPost)
+			}
+		}
+
+		ruleTgList, err := t.getTargetGroupsForRuleAction(ctx, rule)
 		if err != nil {
-			glog.V(2).Infof("Error on buildRules %v \n", err)
 			return err
 		}
 
-		for _, httpRule := range t.httpRoute.Spec.Rules {
-			glog.V(6).Infof("Parsing http rule spec: %v\n", httpRule)
-			var ruleSpec latticemodel.RuleSpec
+		ruleSpec.Action = model.RuleAction{
+			TargetGroups: ruleTgList,
+		}
 
-			if len(httpRule.Matches) > 1 {
-				// only support 1 match today
-				glog.V(2).Infof("Do not support multiple matches: matches == %v ", len(httpRule.Matches))
-				return errors.New(LATTICE_NO_SUPPORT_FOR_MULTIPLE_MATCHES)
+		// don't bother adding rules on delete, these will be removed automatically with the owning route/lattice service
+		// target groups will still be present and removed as needed
+		if t.route.DeletionTimestamp().IsZero() {
+			stackRule, err := model.NewRule(t.stack, ruleSpec)
+			if err != nil {
+				return err
 			}
-
-			if len(httpRule.Matches) == 0 {
-				glog.V(6).Infof("Continue next rule, no matches specified in current rule")
-				continue
-			}
-
-			// only support 1 match today
-			match := httpRule.Matches[0]
-
-			if match.Path != nil && match.Path.Type != nil {
-				glog.V(6).Infof("Examing pathmatch type %v value %v for for httproute %s namespace %s ",
-					*match.Path.Type, *match.Path.Value, t.httpRoute.Name, t.httpRoute.Namespace)
-
-				switch *match.Path.Type {
-				case gateway_api.PathMatchExact:
-					glog.V(6).Infof("Using PathMatchExact for httproute %s namespace %s ",
-						t.httpRoute.Name, t.httpRoute.Namespace)
-					ruleSpec.PathMatchExact = true
-
-				case gateway_api.PathMatchPathPrefix:
-					glog.V(6).Infof("Using PathMatchPathPrefix for httproute %s namespace %s ",
-						t.httpRoute.Name, t.httpRoute.Namespace)
-					ruleSpec.PathMatchPrefix = true
-				default:
-					glog.V(2).Infof("Unsupported path match type %v for httproute %s namespace %s",
-						*match.Path.Type, t.httpRoute.Name, t.httpRoute.Namespace)
-					return errors.New(LATTICE_UNSUPPORTED_PATH_MATCH_TYPE)
-				}
-				ruleSpec.PathMatchValue = *match.Path.Value
-			}
-
-			// header based match
-			// today, only support EXACT match
-			if match.Headers != nil {
-				if len(match.Headers) > LATTICE_MAX_HEADER_MATCHES {
-					return errors.New(LATTICE_EXCEED_MAX_HEADER_MATCHES)
-				}
-
-				ruleSpec.NumOfHeaderMatches = len(match.Headers)
-
-				glog.V(6).Infof("Examing match.Headers %v for httproute %s namespace %s",
-					match.Headers, t.httpRoute.Name, t.httpRoute.Namespace)
-
-				for i, header := range match.Headers {
-					glog.V(6).Infof("Examing match.Header: i = %d header.Type %v", i, *header.Type)
-					if header.Type != nil && gateway_api.HeaderMatchType(*header.Type) != gateway_api.HeaderMatchExact {
-						glog.V(2).Infof("Unsupported header matchtype %v for httproute %v namespace %s",
-							*header.Type, t.httpRoute.Name, t.httpRoute.Namespace)
-						return errors.New(LATTICE_UNSUPPORTED_HEADER_MATCH_TYPE)
-					}
-
-					glog.V(6).Infof("Found HeaderExactMatch==%v for HTTPRoute %v, namespace %v",
-						header.Value, t.httpRoute.Name, t.httpRoute.Namespace)
-
-					matchType := vpclattice.HeaderMatchType{
-						Exact: aws.String(header.Value),
-					}
-					ruleSpec.MatchedHeaders[i].Match = &matchType
-					header_name := header.Name
-
-					glog.V(6).Infof("Found matching i = %d header_name %v", i, &header_name)
-
-					ruleSpec.MatchedHeaders[i].Name = (*string)(&header_name)
-				}
-			}
-
-			// controller do not support these match type today
-			if match.Method != nil || match.QueryParams != nil {
-				glog.V(2).Infof("Unsupported Match Method %v for httproute %v, namespace %v",
-					match.Method, t.httpRoute.Name, t.httpRoute.Namespace)
-				return errors.New(LATTICE_UNSUPPORTED_MATCH_TYPE)
-			}
-			glog.V(6).Infof("Generated ruleSpec is: %v", ruleSpec)
-
-			tgList := []*latticemodel.RuleTargetGroup{}
-
-			for _, httpBackendRef := range httpRule.BackendRefs {
-				glog.V(6).Infof("buildRoutingPolicy - examing backendRef %v\n", httpBackendRef)
-				glog.V(6).Infof("backendref kind: %v\n", *httpBackendRef.BackendObjectReference.Kind)
-
-				ruleTG := latticemodel.RuleTargetGroup{}
-
-				if string(*httpBackendRef.BackendObjectReference.Kind) == "Service" {
-					namespace := t.httpRoute.Namespace
-					if httpBackendRef.BackendObjectReference.Namespace != nil {
-						namespace = string(*httpBackendRef.BackendObjectReference.Namespace)
-					}
-					ruleTG.Name = string(httpBackendRef.BackendObjectReference.Name)
-					ruleTG.Namespace = namespace
-					ruleTG.RouteName = t.httpRoute.Name
-					ruleTG.IsServiceImport = false
-					if httpBackendRef.Weight != nil {
-						ruleTG.Weight = int64(*httpBackendRef.Weight)
-					}
-
-				}
-
-				if string(*httpBackendRef.BackendObjectReference.Kind) == "ServiceImport" {
-					// TODO
-					glog.V(6).Infof("Handle ServiceImport Routing Policy\n")
-					/* I think this need to be done at policy manager API call
-					tg, err := t.Datastore.GetTargetGroup(string(httpBackendRef.BackendObjectReference.Name),
-						"default", true) // isServiceImport==true
-					if err != nil {
-						glog.V(6).Infof("ServiceImport %s Not found, continue \n",
-							string(httpBackendRef.BackendObjectReference.Name))
-						continue
-
-					}
-					*/
-					ruleTG.Name = string(httpBackendRef.BackendObjectReference.Name)
-					ruleTG.Namespace = t.httpRoute.Namespace
-					if httpBackendRef.BackendObjectReference.Namespace != nil {
-						ruleTG.Namespace = string(*httpBackendRef.BackendObjectReference.Namespace)
-					}
-					// the routename for serviceimport is always ""
-					ruleTG.RouteName = ""
-					ruleTG.IsServiceImport = true
-
-					if httpBackendRef.Weight != nil {
-						ruleTG.Weight = int64(*httpBackendRef.Weight)
-					}
-
-				}
-
-				tgList = append(tgList, &ruleTG)
-			}
-
-			ruleIDName := fmt.Sprintf("rule-%d", ruleID)
-			ruleAction := latticemodel.RuleAction{
-				TargetGroups: tgList,
-			}
-			latticemodel.NewRule(t.stack, ruleIDName, t.httpRoute.Name, t.httpRoute.Namespace, port,
-				protocol, ruleAction, ruleSpec)
-			ruleID++
-
+			t.log.Debugf("Added rule %d to the stack (ID %s)", stackRule.Spec.Priority, stackRule.ID())
+		} else {
+			t.log.Debugf("Skipping adding rule %d to the stack since the route is deleted", ruleSpec.Priority)
 		}
 	}
 
 	return nil
+}
+
+func (t *latticeServiceModelBuildTask) updateRuleSpecForHttpRoute(m *core.HTTPRouteMatch, ruleSpec *model.RuleSpec) error {
+	hasPath := m.Path() != nil
+	hasType := hasPath && m.Path().Type != nil
+
+	if hasPath && !hasType {
+		return errors.New("type is required on path match")
+	}
+
+	if hasPath {
+		t.log.Debugf("Examining pathmatch type %s value %s for for httproute %s-%s ",
+			*m.Path().Type, *m.Path().Value, t.route.Name(), t.route.Namespace())
+
+		switch *m.Path().Type {
+		case gwv1.PathMatchExact:
+			t.log.Debugf("Using PathMatchExact for httproute %s-%s ",
+				t.route.Name(), t.route.Namespace())
+			ruleSpec.PathMatchExact = true
+
+		case gwv1.PathMatchPathPrefix:
+			t.log.Debugf("Using PathMatchPathPrefix for httproute %s-%s ",
+				t.route.Name(), t.route.Namespace())
+			ruleSpec.PathMatchPrefix = true
+		default:
+			t.log.Debugf("Unsupported path match type %s for httproute %s-%s",
+				*m.Path().Type, t.route.Name(), t.route.Namespace())
+			return errors.New(LATTICE_UNSUPPORTED_PATH_MATCH_TYPE)
+		}
+		ruleSpec.PathMatchValue = *m.Path().Value
+	}
+
+	// method based match
+	if m.Method() != nil {
+		t.log.Infof("Examining http method %s for httproute %s-%s",
+			*m.Method(), t.route.Name(), t.route.Namespace())
+
+		ruleSpec.Method = string(*m.Method())
+	}
+
+	// controller does not support query matcher type today
+	if m.QueryParams() != nil {
+		t.log.Infof("Unsupported match type for httproute %s, namespace %s",
+			t.route.Name(), t.route.Namespace())
+		return errors.New(LATTICE_UNSUPPORTED_MATCH_TYPE)
+	}
+	return nil
+}
+
+func (t *latticeServiceModelBuildTask) updateRuleSpecForGrpcRoute(m *core.GRPCRouteMatch, ruleSpec *model.RuleSpec) error {
+	t.log.Debugf("Building rule with GRPCRouteMatch, %+v", *m)
+	ruleSpec.Method = string(gwv1.HTTPMethodPost) // GRPC is always POST
+	method := m.Method()
+	// VPC Lattice doesn't support suffix/regex matching, so we can't support method match without service
+	if method.Service == nil && method.Method != nil {
+		return fmt.Errorf("cannot create GRPCRouteMatch for nil service and non-nil method")
+	}
+	switch *method.Type {
+	case gwv1alpha2.GRPCMethodMatchExact:
+		if method.Service == nil {
+			t.log.Debugf("Match all paths due to nil service and nil method")
+			ruleSpec.PathMatchPrefix = true
+			ruleSpec.PathMatchValue = "/"
+		} else if method.Method == nil {
+			t.log.Debugf("Match by specific gRPC service %s, regardless of method", *method.Service)
+			ruleSpec.PathMatchPrefix = true
+			ruleSpec.PathMatchValue = fmt.Sprintf("/%s/", *method.Service)
+		} else {
+			t.log.Debugf("Match by specific gRPC service %s and method %s", *method.Service, *method.Method)
+			ruleSpec.PathMatchExact = true
+			ruleSpec.PathMatchValue = fmt.Sprintf("/%s/%s", *method.Service, *method.Method)
+		}
+	default:
+		return fmt.Errorf("unsupported gRPC method match type %s", *method.Type)
+	}
+	return nil
+}
+
+func (t *latticeServiceModelBuildTask) updateRuleSpecWithHeaderMatches(match core.RouteMatch, ruleSpec *model.RuleSpec) error {
+	if match.Headers() == nil {
+		return nil
+	}
+
+	if len(match.Headers()) > LATTICE_MAX_HEADER_MATCHES {
+		return errors.New(LATTICE_EXCEED_MAX_HEADER_MATCHES)
+	}
+
+	t.log.Debugf("Examining match headers for route %s-%s", t.route.Name(), t.route.Namespace())
+
+	for _, header := range match.Headers() {
+		t.log.Debugf("Examining match.Header: header.Type %s", *header.Type())
+		if header.Type() != nil && *header.Type() != gwv1.HeaderMatchExact {
+			t.log.Debugf("Unsupported header matchtype %s for httproute %s-%s",
+				*header.Type(), t.route.Name(), t.route.Namespace())
+			return errors.New(LATTICE_UNSUPPORTED_HEADER_MATCH_TYPE)
+		}
+
+		matchType := vpclattice.HeaderMatchType{
+			Exact: aws.String(header.Value()),
+		}
+		headerName := header.Name()
+
+		headerMatch := vpclattice.HeaderMatch{}
+		headerMatch.Match = &matchType
+		headerMatch.Name = &headerName
+
+		ruleSpec.MatchedHeaders = append(ruleSpec.MatchedHeaders, headerMatch)
+	}
+
+	return nil
+}
+
+func (t *latticeServiceModelBuildTask) getTargetGroupsForRuleAction(ctx context.Context, rule core.RouteRule) ([]*model.RuleTargetGroup, error) {
+	var tgList []*model.RuleTargetGroup
+
+	for _, backendRef := range rule.BackendRefs() {
+		ruleTG := model.RuleTargetGroup{
+			Weight: 1, // default value according to spec
+		}
+		if backendRef.Weight() != nil {
+			ruleTG.Weight = int64(*backendRef.Weight())
+		}
+
+		namespace := t.route.Namespace()
+		if backendRef.Namespace() != nil {
+			namespace = string(*backendRef.Namespace())
+		}
+
+		t.log.Debugf("Processing %s backendRef %s-%s", string(*backendRef.Kind()), backendRef.Name(), namespace)
+
+		if string(*backendRef.Kind()) == "ServiceImport" {
+			// there needs to be a pre-existing target group, we fetch all the fields
+			// needed to identify it
+			svcImportTg := model.SvcImportTargetGroup{
+				K8SServiceNamespace: namespace,
+				K8SServiceName:      string(backendRef.Name()),
+			}
+
+			// if there's a matching top-level service import, we can get additional fields
+			svcImportName := types.NamespacedName{
+				Namespace: namespace,
+				Name:      string(backendRef.Name()),
+			}
+			svcImport := &anv1alpha1.ServiceImport{}
+			if err := t.client.Get(ctx, svcImportName, svcImport); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return nil, err
+				}
+			}
+			vpc, ok := svcImport.Annotations["application-networking.k8s.aws/aws-vpc"]
+			if ok {
+				svcImportTg.VpcId = vpc
+			}
+
+			eksCluster, ok := svcImport.Annotations["application-networking.k8s.aws/aws-eks-cluster-name"]
+			if ok {
+				svcImportTg.K8SClusterName = eksCluster
+			}
+			ruleTG.SvcImportTG = &svcImportTg
+		}
+
+		if string(*backendRef.Kind()) == "Service" {
+			// generate the actual target group model for the backendRef
+			_, tg, err := t.brTgBuilder.Build(ctx, t.route, backendRef, t.stack)
+			if err != nil {
+				ibre := &InvalidBackendRefError{}
+				if !errors.As(err, &ibre) {
+					return nil, err
+				}
+
+				t.log.Infof("Invalid backendRef found on route %s", t.route.Name())
+				ruleTG.StackTargetGroupId = model.InvalidBackendRefTgId
+			} else {
+				ruleTG.StackTargetGroupId = tg.ID()
+			}
+		}
+
+		tgList = append(tgList, &ruleTG)
+	}
+
+	return tgList, nil
 }

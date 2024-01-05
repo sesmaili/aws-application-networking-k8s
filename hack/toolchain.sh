@@ -7,6 +7,15 @@ KUBEBUILDER_ASSETS="${KUBEBUILDER_ASSETS:="${HOME}/.kubebuilder/bin"}"
 main() {
     tools
     kubebuilder
+    install_golangci_lint
+}
+
+install_golangci_lint() {
+    if { [ -z "${CI+x}" ] || [ "${CI}" != "true" ]; } && ! command -v golangci-lint &> /dev/null; then
+        echo "golangci-lint is not installed in local machine. Installing..."
+        # https://golangci-lint.run/usage/install/#local-installation
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.55.2
+    fi
 }
 
 tools() {
@@ -18,6 +27,7 @@ tools() {
     go install github.com/golang/mock/mockgen@v1.6.0
     go install sigs.k8s.io/kustomize/kustomize/v4@v4.5.7
     go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20220421205612-c162794a9b12
+    go install github.com/mattn/goveralls@b031368
 }
 
 kubebuilder() {

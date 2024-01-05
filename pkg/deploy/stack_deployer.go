@@ -2,34 +2,27 @@ package deploy
 
 import (
 	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
 
-	"github.com/aws/aws-application-networking-k8s/pkg/aws"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	pkg_aws "github.com/aws/aws-application-networking-k8s/pkg/aws"
 	"github.com/aws/aws-application-networking-k8s/pkg/deploy/externaldns"
 	"github.com/aws/aws-application-networking-k8s/pkg/deploy/lattice"
-	"github.com/aws/aws-application-networking-k8s/pkg/latticestore"
+	"github.com/aws/aws-application-networking-k8s/pkg/gateway"
 	"github.com/aws/aws-application-networking-k8s/pkg/model/core"
-	latticemodel "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"github.com/aws/aws-application-networking-k8s/pkg/utils/gwlog"
 )
 
-// StackDeployer will deploy a resource stack into AWS and K8S.
+const (
+	TG_GC_IVL = time.Second * 30
+)
+
 type StackDeployer interface {
-	// Deploy a resource stack.
 	Deploy(ctx context.Context, stack core.Stack) error
-}
-
-//var _ StackDeployer = &defaultStackDeployer{}
-
-// TODO,  later might have a single stack, righ now will have
-// dedicated stack for serviceNetwork/service/targetgroup
-type serviceNetworkStackDeployer struct {
-	cloud     aws.Cloud
-	k8sclient client.Client
-	// TODO vpcID     string
-
-	//TODO others
-	latticeServiceNetworkManager lattice.ServiceNetworkManager
-	latticeDataStore             *latticestore.LatticeDataStore
 }
 
 type ResourceSynthesizer interface {
@@ -37,19 +30,8 @@ type ResourceSynthesizer interface {
 	PostSynthesize(ctx context.Context) error
 }
 
-func NewServiceNetworkStackDeployer(cloud aws.Cloud, k8sClient client.Client, latticeDataStore *latticestore.LatticeDataStore) *serviceNetworkStackDeployer {
-	return &serviceNetworkStackDeployer{
-		cloud:                        cloud,
-		k8sclient:                    k8sClient,
-		latticeServiceNetworkManager: lattice.NewDefaultServiceNetworkManager(cloud),
-		latticeDataStore:             latticeDataStore,
-	}
-}
-
 // Deploy a resource stack
-
 func deploy(ctx context.Context, stack core.Stack, synthesizers []ResourceSynthesizer) error {
-
 	for _, synthesizer := range synthesizers {
 		if err := synthesizer.Synthesize(ctx); err != nil {
 			return err
@@ -64,151 +46,249 @@ func deploy(ctx context.Context, stack core.Stack, synthesizers []ResourceSynthe
 	return nil
 }
 
-func (d *serviceNetworkStackDeployer) Deploy(ctx context.Context, stack core.Stack) error {
-	synthesizers := []ResourceSynthesizer{
-		lattice.NewServiceNetworkSynthesizer(d.k8sclient, d.latticeServiceNetworkManager, stack, d.latticeDataStore),
-	}
-	return deploy(ctx, stack, synthesizers)
-}
-
 type latticeServiceStackDeployer struct {
-	cloud                 aws.Cloud
-	k8sclient             client.Client
+	log                   gwlog.Logger
+	cloud                 pkg_aws.Cloud
+	k8sClient             client.Client
 	latticeServiceManager lattice.ServiceManager
 	targetGroupManager    lattice.TargetGroupManager
 	targetsManager        lattice.TargetsManager
 	listenerManager       lattice.ListenerManager
 	ruleManager           lattice.RuleManager
 	dnsEndpointManager    externaldns.DnsEndpointManager
-	latticeDataStore      *latticestore.LatticeDataStore
+	svcExportTgBuilder    gateway.SvcExportTargetGroupModelBuilder
+	svcBuilder            gateway.LatticeServiceBuilder
 }
 
-func NewLatticeServiceStackDeploy(cloud aws.Cloud, k8sClient client.Client, latticeDataStore *latticestore.LatticeDataStore) *latticeServiceStackDeployer {
+var tgGcOnce sync.Once
+var tgGc *TgGc
+
+func NewLatticeServiceStackDeploy(
+	log gwlog.Logger,
+	cloud pkg_aws.Cloud,
+	k8sClient client.Client,
+) *latticeServiceStackDeployer {
+	brTgBuilder := gateway.NewBackendRefTargetGroupBuilder(log, k8sClient)
+
+	tgMgr := lattice.NewTargetGroupManager(log, cloud)
+	tgSvcExpBuilder := gateway.NewSvcExportTargetGroupBuilder(log, k8sClient)
+	svcBuilder := gateway.NewLatticeServiceBuilder(log, k8sClient, brTgBuilder)
+
+	tgGcOnce.Do(func() {
+		// TODO: need to refactor TG synthesizer. Remove stack from constructor
+		// arguments and use it as Synth argument. That will help with Synth
+		// reuse for GC purposes
+		tgGcSynth := lattice.NewTargetGroupSynthesizer(log, cloud, k8sClient, tgMgr, tgSvcExpBuilder, svcBuilder, nil)
+		tgGcFn := NewTgGcFn(tgGcSynth)
+		tgGc = &TgGc{
+			lock:    sync.Mutex{},
+			log:     log.Named("tg-gc"),
+			ctx:     context.TODO(),
+			isDone:  atomic.Bool{},
+			ivl:     TG_GC_IVL,
+			cycleFn: tgGcFn,
+		}
+		tgGc.start()
+	})
+
 	return &latticeServiceStackDeployer{
+		log:                   log,
 		cloud:                 cloud,
-		k8sclient:             k8sClient,
-		latticeServiceManager: lattice.NewServiceManager(cloud, latticeDataStore),
-		targetGroupManager:    lattice.NewTargetGroupManager(cloud),
-		targetsManager:        lattice.NewTargetsManager(cloud, latticeDataStore),
-		listenerManager:       lattice.NewListenerManager(cloud, latticeDataStore),
-		ruleManager:           lattice.NewRuleManager(cloud, latticeDataStore),
-		dnsEndpointManager:    externaldns.NewDnsEndpointManager(k8sClient),
-		latticeDataStore:      latticeDataStore,
+		k8sClient:             k8sClient,
+		latticeServiceManager: lattice.NewServiceManager(log, cloud),
+		targetGroupManager:    tgMgr,
+		targetsManager:        lattice.NewTargetsManager(log, cloud),
+		listenerManager:       lattice.NewListenerManager(log, cloud),
+		ruleManager:           lattice.NewRuleManager(log, cloud),
+		dnsEndpointManager:    externaldns.NewDnsEndpointManager(log, k8sClient),
+		svcExportTgBuilder:    tgSvcExpBuilder,
+		svcBuilder:            svcBuilder,
 	}
 }
 
+type TgGcCycleFn = func(context.Context) (TgGcResult, error)
+
+func NewTgGcFn(tgSynth *lattice.TargetGroupSynthesizer) TgGcCycleFn {
+	return func(ctx context.Context) (TgGcResult, error) {
+		t0 := time.Now()
+		results, err := tgSynth.SynthesizeUnusedDelete(ctx)
+		if err != nil {
+			return TgGcResult{}, err
+		}
+		succ := 0
+		for _, res := range results {
+			if res.Err == nil {
+				succ += 1
+			}
+		}
+		return TgGcResult{
+			att:      len(results),
+			succ:     succ,
+			duration: time.Since(t0),
+		}, nil
+	}
+}
+
+type TgGc struct {
+	lock    sync.Mutex
+	log     gwlog.Logger
+	ctx     context.Context
+	isDone  atomic.Bool
+	ivl     time.Duration
+	cycleFn TgGcCycleFn
+}
+
+type TgGcResult struct {
+	// number deletion attempts
+	att int
+	// number of successful deletions
+	succ int
+	// cycle duration
+	duration time.Duration
+}
+
+func (gc *TgGc) start() {
+	ticker := time.NewTicker(gc.ivl)
+	go func() {
+		for {
+			select {
+			case <-gc.ctx.Done():
+				gc.log.Info("stop GC, ctx is done")
+				gc.isDone.Store(true)
+				return
+			case <-ticker.C:
+				gc.cycle()
+			}
+		}
+	}()
+}
+
+func (gc *TgGc) cycle() {
+	defer func() {
+		if r := recover(); r != nil {
+			gc.log.Errorf("gc cycle panic: %s", r)
+		}
+		gc.lock.Unlock()
+	}()
+	gc.lock.Lock()
+	res, err := gc.cycleFn(gc.ctx)
+	if err != nil {
+		gc.log.Debugf("gc cycle error: %s", err)
+	}
+	gc.log.Debugw("gc stats",
+		"delete_attempts", res.att,
+		"delete_success", res.succ,
+		"duration", res.duration,
+	)
+}
+
 func (d *latticeServiceStackDeployer) Deploy(ctx context.Context, stack core.Stack) error {
-	targetGroupSynthesizer := lattice.NewTargetGroupSynthesizer(d.cloud, d.k8sclient, d.targetGroupManager, stack, d.latticeDataStore)
-	targetsSynthesizer := lattice.NewTargetsSynthesizer(d.cloud, d.targetsManager, stack, d.latticeDataStore)
-	serviceSynthesizer := lattice.NewServiceSynthesizer(d.latticeServiceManager, d.dnsEndpointManager, stack, d.latticeDataStore)
-	listenerSynthesizer := lattice.NewListenerSynthesizer(d.listenerManager, stack, d.latticeDataStore)
-	ruleSynthesizer := lattice.NewRuleSynthesizer(d.ruleManager, stack, d.latticeDataStore)
+	targetGroupSynthesizer := lattice.NewTargetGroupSynthesizer(d.log, d.cloud, d.k8sClient, d.targetGroupManager, d.svcExportTgBuilder, d.svcBuilder, stack)
+	targetsSynthesizer := lattice.NewTargetsSynthesizer(d.log, d.cloud, d.targetsManager, stack)
+	serviceSynthesizer := lattice.NewServiceSynthesizer(d.log, d.latticeServiceManager, d.dnsEndpointManager, stack)
+	listenerSynthesizer := lattice.NewListenerSynthesizer(d.log, d.listenerManager, stack)
+	ruleSynthesizer := lattice.NewRuleSynthesizer(d.log, d.ruleManager, d.targetGroupManager, stack)
+
+	// We need to block GC when we deploy stack. Stack deployer first creates TG and then
+	// associate TG with Service. If GC will run in between it can delete newly created TG
+	// before association since it's dangling TG. This lock also prevents concurrent
+	// deployments, only one deployment can run at the time.
+	//
+	// TODO: This place can become a contention. May be debug log with lock waiting time?
+	defer func() {
+		tgGc.lock.Unlock()
+	}()
+	tgGc.lock.Lock()
 
 	//Handle targetGroups creation request
-	if err := targetGroupSynthesizer.SynthesizeTriggeredTargetGroupsCreation(ctx); err != nil {
-		return err
+	if err := targetGroupSynthesizer.SynthesizeCreate(ctx); err != nil {
+		return fmt.Errorf("error during tg synthesis %w", err)
 	}
 
 	//Handle targets "reconciliation" request (register intend-to-be-registered targets and deregister intend-to-be-registered targets)
 	if err := targetsSynthesizer.Synthesize(ctx); err != nil {
-		return err
+		return fmt.Errorf("error during target synthesis %w", err)
 	}
 
 	// Handle latticeService "reconciliation" request
 	if err := serviceSynthesizer.Synthesize(ctx); err != nil {
-		return err
+		return fmt.Errorf("error during service synthesis %w", err)
 	}
 
 	//Handle latticeService listeners "reconciliation" request
 	if err := listenerSynthesizer.Synthesize(ctx); err != nil {
-		return err
+		return fmt.Errorf("error during listener synthesis %w", err)
 	}
 
 	//Handle latticeService listener's rules "reconciliation" request
 	if err := ruleSynthesizer.Synthesize(ctx); err != nil {
-		return err
+		return fmt.Errorf("error during rule synthesis %w", err)
 	}
 
 	//Handle targetGroup deletion request
-	if err := targetGroupSynthesizer.SynthesizeTriggeredTargetGroupsDeletion(ctx); err != nil {
-		return err
-	}
-
-	// Do garbage collection for not-in-use targetGroups
-	//TODO: run SynthesizeSDKTargetGroups(ctx) as a global garbage collector scheduled backgroud task (i.e., run it as a goroutine in main.go)
-	if err := targetGroupSynthesizer.SynthesizeSDKTargetGroups(ctx); err != nil {
-		return err
+	if err := targetGroupSynthesizer.SynthesizeDelete(ctx); err != nil {
+		return fmt.Errorf("error during tg delete synthesis %w", err)
 	}
 
 	return nil
 }
 
 type latticeTargetGroupStackDeployer struct {
-	cloud              aws.Cloud
+	log                gwlog.Logger
+	cloud              pkg_aws.Cloud
 	k8sclient          client.Client
 	targetGroupManager lattice.TargetGroupManager
-	latticeDatastore   *latticestore.LatticeDataStore
+	svcExportTgBuilder gateway.SvcExportTargetGroupModelBuilder
+	svcBuilder         gateway.LatticeServiceBuilder
 }
 
 // triggered by service export
-func NewTargetGroupStackDeploy(cloud aws.Cloud, k8sClient client.Client, latticeDataStore *latticestore.LatticeDataStore) *latticeTargetGroupStackDeployer {
+func NewTargetGroupStackDeploy(
+	log gwlog.Logger,
+	cloud pkg_aws.Cloud,
+	k8sClient client.Client,
+) *latticeTargetGroupStackDeployer {
+	brTgBuilder := gateway.NewBackendRefTargetGroupBuilder(log, k8sClient)
+
 	return &latticeTargetGroupStackDeployer{
+		log:                log,
 		cloud:              cloud,
 		k8sclient:          k8sClient,
-		targetGroupManager: lattice.NewTargetGroupManager(cloud),
-		latticeDatastore:   latticeDataStore,
+		targetGroupManager: lattice.NewTargetGroupManager(log, cloud),
+		svcExportTgBuilder: gateway.NewSvcExportTargetGroupBuilder(log, k8sClient),
+		svcBuilder:         gateway.NewLatticeServiceBuilder(log, k8sClient, brTgBuilder),
 	}
 }
 
 func (d *latticeTargetGroupStackDeployer) Deploy(ctx context.Context, stack core.Stack) error {
 	synthesizers := []ResourceSynthesizer{
-		lattice.NewTargetGroupSynthesizer(d.cloud, d.k8sclient, d.targetGroupManager, stack, d.latticeDatastore),
-		lattice.NewTargetsSynthesizer(d.cloud, lattice.NewTargetsManager(d.cloud, d.latticeDatastore), stack, d.latticeDatastore),
+		lattice.NewTargetGroupSynthesizer(d.log, d.cloud, d.k8sclient, d.targetGroupManager, d.svcExportTgBuilder, d.svcBuilder, stack),
+		lattice.NewTargetsSynthesizer(d.log, d.cloud, lattice.NewTargetsManager(d.log, d.cloud), stack),
 	}
 	return deploy(ctx, stack, synthesizers)
 }
 
-type latticeTargetsStackDeploy struct {
-	k8sclient        client.Client
-	stack            core.Stack
-	targetsManager   lattice.TargetsManager
-	latticeDataStore *latticestore.LatticeDataStore
+type accessLogSubscriptionStackDeployer struct {
+	log       gwlog.Logger
+	k8sClient client.Client
+	manager   lattice.AccessLogSubscriptionManager
 }
 
-func NewTargetsStackDeploy(cloud aws.Cloud, k8sClient client.Client, latticeDataStore *latticestore.LatticeDataStore) *latticeTargetsStackDeploy {
-	return &latticeTargetsStackDeploy{
-		k8sclient:        k8sClient,
-		targetsManager:   lattice.NewTargetsManager(cloud, latticeDataStore),
-		latticeDataStore: latticeDataStore,
+func NewAccessLogSubscriptionStackDeployer(
+	log gwlog.Logger,
+	cloud pkg_aws.Cloud,
+	k8sClient client.Client,
+) *accessLogSubscriptionStackDeployer {
+	return &accessLogSubscriptionStackDeployer{
+		log:       log,
+		k8sClient: k8sClient,
+		manager:   lattice.NewAccessLogSubscriptionManager(log, cloud),
 	}
-
 }
 
-func (d *latticeTargetsStackDeploy) Deploy(ctx context.Context, stack core.Stack) error {
-	var resTargets []*latticemodel.Targets
-
-	d.stack = stack
-
-	d.stack.ListResources(&resTargets)
-
-	for _, targets := range resTargets {
-		err := d.targetsManager.Create(ctx, targets)
-		if err == nil {
-			tgName := latticestore.TargetGroupName(targets.Spec.Name, targets.Spec.Namespace)
-
-			var targetList []latticestore.Target
-			for _, target := range targetList {
-				t := latticestore.Target{
-					TargetIP:   target.TargetIP,
-					TargetPort: target.TargetPort,
-				}
-
-				targetList = append(targetList, t)
-
-			}
-			d.latticeDataStore.UpdateTargetsForTargetGroup(tgName, targets.Spec.RouteName, targetList)
-		}
-
+func (d *accessLogSubscriptionStackDeployer) Deploy(ctx context.Context, stack core.Stack) error {
+	synthesizers := []ResourceSynthesizer{
+		lattice.NewAccessLogSubscriptionSynthesizer(d.log, d.k8sClient, d.manager, stack),
 	}
-	return nil
+	return deploy(ctx, stack, synthesizers)
 }

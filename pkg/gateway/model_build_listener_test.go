@@ -3,62 +3,46 @@ package gateway
 import (
 	"context"
 	"errors"
-	"fmt"
-	"testing"
-
+	mock_client "github.com/aws/aws-application-networking-k8s/mocks/controller-runtime/client"
+	"github.com/aws/aws-application-networking-k8s/pkg/k8s"
+	"github.com/aws/aws-application-networking-k8s/pkg/model/core"
+	model "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
+	"github.com/aws/aws-application-networking-k8s/pkg/utils/gwlog"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	gateway_api "sigs.k8s.io/gateway-api/apis/v1beta1"
-
 	"k8s.io/apimachinery/pkg/types"
-
-	mock_client "github.com/aws/aws-application-networking-k8s/mocks/controller-runtime/client"
-
-	"github.com/aws/aws-application-networking-k8s/pkg/latticestore"
-	"github.com/aws/aws-application-networking-k8s/pkg/model/core"
-
-	"github.com/aws/aws-application-networking-k8s/pkg/k8s"
-	latticemodel "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	"testing"
 )
 
 // PortNumberPtr translates an int to a *PortNumber
-func PortNumberPtr(p int) *gateway_api.PortNumber {
-	result := gateway_api.PortNumber(p)
+func PortNumberPtr(p int) *gwv1beta1.PortNumber {
+	result := gwv1beta1.PortNumber(p)
 	return &result
 }
 
 func Test_ListenerModelBuild(t *testing.T) {
-	var httpSectionName gateway_api.SectionName = "http"
-	var missingSectionName gateway_api.SectionName = "miss"
-	var serviceKind gateway_api.Kind = "Service"
-	var serviceimportKind gateway_api.Kind = "ServiceImport"
-	var backendRef = gateway_api.BackendRef{
-		BackendObjectReference: gateway_api.BackendObjectReference{
+	var httpSectionName gwv1beta1.SectionName = "http"
+	var missingSectionName gwv1beta1.SectionName = "miss"
+	var serviceKind gwv1beta1.Kind = "Service"
+	var backendRef = gwv1beta1.BackendRef{
+		BackendObjectReference: gwv1beta1.BackendObjectReference{
 			Name: "targetgroup1",
 			Kind: &serviceKind,
-		},
-	}
-	var backendServiceImportRef = gateway_api.BackendRef{
-		BackendObjectReference: gateway_api.BackendObjectReference{
-			Name: "targetgroup1",
-			Kind: &serviceimportKind,
 		},
 	}
 
 	tests := []struct {
 		name               string
-		gwListenerPort     gateway_api.PortNumber
-		gwListenerProtocol gateway_api.ProtocolType
-		httpRoute          *gateway_api.HTTPRoute
+		gwListenerPort     gwv1beta1.PortNumber
+		route              core.Route
 		wantErrIsNil       bool
 		k8sGetGatewayCall  bool
 		k8sGatewayReturnOK bool
 		tlsTerminate       bool
-		noTLSOption        bool
-		wrongTLSOption     bool
-		certARN            string
+		expectedSpec       []model.ListenerSpec
 	}{
 		{
 			name:               "listener, default service action",
@@ -66,23 +50,24 @@ func Test_ListenerModelBuild(t *testing.T) {
 			wantErrIsNil:       true,
 			k8sGetGatewayCall:  true,
 			k8sGatewayReturnOK: true,
-			httpRoute: &gateway_api.HTTPRoute{
+			tlsTerminate:       false,
+			route: core.NewHTTPRoute(gwv1beta1.HTTPRoute{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "service1",
 					Namespace: "default",
 				},
-				Spec: gateway_api.HTTPRouteSpec{
-					CommonRouteSpec: gateway_api.CommonRouteSpec{
-						ParentRefs: []gateway_api.ParentReference{
+				Spec: gwv1beta1.HTTPRouteSpec{
+					CommonRouteSpec: gwv1beta1.CommonRouteSpec{
+						ParentRefs: []gwv1beta1.ParentReference{
 							{
-								Name:        "mesh1",
+								Name:        "gw1",
 								SectionName: &httpSectionName,
 							},
 						},
 					},
-					Rules: []gateway_api.HTTPRouteRule{
+					Rules: []gwv1beta1.HTTPRouteRule{
 						{
-							BackendRefs: []gateway_api.HTTPBackendRef{
+							BackendRefs: []gwv1beta1.HTTPBackendRef{
 								{
 									BackendRef: backendRef,
 								},
@@ -90,33 +75,41 @@ func Test_ListenerModelBuild(t *testing.T) {
 						},
 					},
 				},
+			}),
+			expectedSpec: []model.ListenerSpec{
+				{
+					StackServiceId:    "svc-id",
+					K8SRouteName:      "service1",
+					K8SRouteNamespace: "default",
+					Port:              80,
+					Protocol:          "HTTP",
+				},
 			},
 		},
 		{
-			name:               "listener, tls with cert arn",
-			gwListenerPort:     *PortNumberPtr(80),
+			name:               "tls listener",
+			gwListenerPort:     *PortNumberPtr(443),
 			wantErrIsNil:       true,
 			k8sGetGatewayCall:  true,
 			k8sGatewayReturnOK: true,
 			tlsTerminate:       true,
-			certARN:            "test-cert-ARN",
-			httpRoute: &gateway_api.HTTPRoute{
+			route: core.NewHTTPRoute(gwv1beta1.HTTPRoute{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "service1",
 					Namespace: "default",
 				},
-				Spec: gateway_api.HTTPRouteSpec{
-					CommonRouteSpec: gateway_api.CommonRouteSpec{
-						ParentRefs: []gateway_api.ParentReference{
+				Spec: gwv1beta1.HTTPRouteSpec{
+					CommonRouteSpec: gwv1beta1.CommonRouteSpec{
+						ParentRefs: []gwv1beta1.ParentReference{
 							{
-								Name:        "mesh1",
+								Name:        "gw1",
 								SectionName: &httpSectionName,
 							},
 						},
 					},
-					Rules: []gateway_api.HTTPRouteRule{
+					Rules: []gwv1beta1.HTTPRouteRule{
 						{
-							BackendRefs: []gateway_api.HTTPBackendRef{
+							BackendRefs: []gwv1beta1.HTTPBackendRef{
 								{
 									BackendRef: backendRef,
 								},
@@ -124,125 +117,34 @@ func Test_ListenerModelBuild(t *testing.T) {
 						},
 					},
 				},
-			},
-		},
-		{
-			name:               "listener, tls mode is not terminate",
-			gwListenerPort:     *PortNumberPtr(80),
-			wantErrIsNil:       true,
-			k8sGetGatewayCall:  true,
-			k8sGatewayReturnOK: true,
-			tlsTerminate:       false,
-			certARN:            "test-cert-ARN",
-			httpRoute: &gateway_api.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "service1",
-					Namespace: "default",
-				},
-				Spec: gateway_api.HTTPRouteSpec{
-					CommonRouteSpec: gateway_api.CommonRouteSpec{
-						ParentRefs: []gateway_api.ParentReference{
-							{
-								Name:        "mesh1",
-								SectionName: &httpSectionName,
-							},
-						},
-					},
-					Rules: []gateway_api.HTTPRouteRule{
-						{
-							BackendRefs: []gateway_api.HTTPBackendRef{
-								{
-									BackendRef: backendRef,
-								},
-							},
-						},
-					},
+			}),
+			expectedSpec: []model.ListenerSpec{
+				{
+					StackServiceId:    "svc-id",
+					K8SRouteName:      "service1",
+					K8SRouteNamespace: "default",
+					Port:              443,
+					Protocol:          "HTTPS",
 				},
 			},
 		},
 		{
-			name:               "listener, with wrong annotation",
-			gwListenerPort:     *PortNumberPtr(80),
-			wantErrIsNil:       true,
-			k8sGetGatewayCall:  true,
-			k8sGatewayReturnOK: true,
-			tlsTerminate:       false,
-			certARN:            "test-cert-ARN",
-			httpRoute: &gateway_api.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "service1",
-					Namespace: "default",
-				},
-				Spec: gateway_api.HTTPRouteSpec{
-					CommonRouteSpec: gateway_api.CommonRouteSpec{
-						ParentRefs: []gateway_api.ParentReference{
-							{
-								Name:        "mesh1",
-								SectionName: &httpSectionName,
-							},
-						},
-					},
-					Rules: []gateway_api.HTTPRouteRule{
-						{
-							BackendRefs: []gateway_api.HTTPBackendRef{
-								{
-									BackendRef: backendRef,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		{
-			name:               "listener, default serviceimport action",
-			gwListenerPort:     *PortNumberPtr(80),
-			wantErrIsNil:       true,
-			k8sGetGatewayCall:  true,
-			k8sGatewayReturnOK: true,
-			httpRoute: &gateway_api.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "service1",
-					Namespace: "default",
-				},
-				Spec: gateway_api.HTTPRouteSpec{
-					CommonRouteSpec: gateway_api.CommonRouteSpec{
-						ParentRefs: []gateway_api.ParentReference{
-							{
-								Name:        "mesh1",
-								SectionName: &httpSectionName,
-							},
-						},
-					},
-					Rules: []gateway_api.HTTPRouteRule{
-						{
-							BackendRefs: []gateway_api.HTTPBackendRef{
-								{
-									BackendRef: backendServiceImportRef,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		{
-			name:              "no parentref ",
+			name:              "no parentref",
 			gwListenerPort:    *PortNumberPtr(80),
-			wantErrIsNil:      false,
+			wantErrIsNil:      true,
 			k8sGetGatewayCall: false,
-			httpRoute: &gateway_api.HTTPRoute{
+			route: core.NewHTTPRoute(gwv1beta1.HTTPRoute{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "service1",
 					Namespace: "default",
 				},
-				Spec: gateway_api.HTTPRouteSpec{
-					CommonRouteSpec: gateway_api.CommonRouteSpec{
-						ParentRefs: []gateway_api.ParentReference{},
+				Spec: gwv1beta1.HTTPRouteSpec{
+					CommonRouteSpec: gwv1beta1.CommonRouteSpec{
+						ParentRefs: []gwv1beta1.ParentReference{},
 					},
-					Rules: []gateway_api.HTTPRouteRule{
+					Rules: []gwv1beta1.HTTPRouteRule{
 						{
-							BackendRefs: []gateway_api.HTTPBackendRef{
+							BackendRefs: []gwv1beta1.HTTPBackendRef{
 								{
 									BackendRef: backendRef,
 								},
@@ -250,7 +152,8 @@ func Test_ListenerModelBuild(t *testing.T) {
 						},
 					},
 				},
-			},
+			}),
+			expectedSpec: []model.ListenerSpec{}, // empty list
 		},
 		{
 			name:               "No k8sgateway object",
@@ -258,23 +161,23 @@ func Test_ListenerModelBuild(t *testing.T) {
 			wantErrIsNil:       false,
 			k8sGetGatewayCall:  true,
 			k8sGatewayReturnOK: false,
-			httpRoute: &gateway_api.HTTPRoute{
+			route: core.NewHTTPRoute(gwv1beta1.HTTPRoute{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "service1",
 					Namespace: "default",
 				},
-				Spec: gateway_api.HTTPRouteSpec{
-					CommonRouteSpec: gateway_api.CommonRouteSpec{
-						ParentRefs: []gateway_api.ParentReference{
+				Spec: gwv1beta1.HTTPRouteSpec{
+					CommonRouteSpec: gwv1beta1.CommonRouteSpec{
+						ParentRefs: []gwv1beta1.ParentReference{
 							{
-								Name:        "mesh1",
+								Name:        "gw1",
 								SectionName: &httpSectionName,
 							},
 						},
 					},
-					Rules: []gateway_api.HTTPRouteRule{
+					Rules: []gwv1beta1.HTTPRouteRule{
 						{
-							BackendRefs: []gateway_api.HTTPBackendRef{
+							BackendRefs: []gwv1beta1.HTTPBackendRef{
 								{
 									BackendRef: backendRef,
 								},
@@ -282,31 +185,31 @@ func Test_ListenerModelBuild(t *testing.T) {
 						},
 					},
 				},
-			},
+			}),
 		},
 		{
-			name:               "no section name ",
+			name:               "no section name",
 			gwListenerPort:     *PortNumberPtr(80),
 			wantErrIsNil:       false,
 			k8sGetGatewayCall:  true,
 			k8sGatewayReturnOK: true,
-			httpRoute: &gateway_api.HTTPRoute{
+			route: core.NewHTTPRoute(gwv1beta1.HTTPRoute{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "service1",
 					Namespace: "default",
 				},
-				Spec: gateway_api.HTTPRouteSpec{
-					CommonRouteSpec: gateway_api.CommonRouteSpec{
-						ParentRefs: []gateway_api.ParentReference{
+				Spec: gwv1beta1.HTTPRouteSpec{
+					CommonRouteSpec: gwv1beta1.CommonRouteSpec{
+						ParentRefs: []gwv1beta1.ParentReference{
 							{
-								Name:        "mesh1",
+								Name:        "gw1",
 								SectionName: &missingSectionName,
 							},
 						},
 					},
-					Rules: []gateway_api.HTTPRouteRule{
+					Rules: []gwv1beta1.HTTPRouteRule{
 						{
-							BackendRefs: []gateway_api.HTTPBackendRef{
+							BackendRefs: []gwv1beta1.HTTPBackendRef{
 								{
 									BackendRef: backendRef,
 								},
@@ -314,125 +217,76 @@ func Test_ListenerModelBuild(t *testing.T) {
 						},
 					},
 				},
-			},
+			}),
 		},
 	}
 
 	for _, tt := range tests {
-		fmt.Printf("testing >>>>> %s =============\n", tt.name)
-		c := gomock.NewController(t)
-		defer c.Finish()
-		ctx := context.TODO()
+		t.Run(tt.name, func(t *testing.T) {
+			c := gomock.NewController(t)
+			defer c.Finish()
+			ctx := context.TODO()
 
-		k8sClient := mock_client.NewMockClient(c)
+			mockK8sClient := mock_client.NewMockClient(c)
 
-		if tt.k8sGetGatewayCall {
-
-			k8sClient.EXPECT().Get(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
-				func(ctx context.Context, gwName types.NamespacedName, gw *gateway_api.Gateway, arg3 ...interface{}) error {
-
-					if tt.k8sGatewayReturnOK {
-						listener := gateway_api.Listener{
+			if tt.k8sGetGatewayCall {
+				mockK8sClient.EXPECT().Get(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+					func(ctx context.Context, gwName types.NamespacedName, gw *gwv1beta1.Gateway, arg3 ...interface{}) error {
+						if !tt.k8sGatewayReturnOK {
+							return errors.New("unknown k8s object")
+						}
+						listener := gwv1beta1.Listener{
 							Port:     tt.gwListenerPort,
 							Protocol: "HTTP",
-							Name:     *tt.httpRoute.Spec.ParentRefs[0].SectionName,
+							Name:     httpSectionName,
 						}
 
 						if tt.tlsTerminate {
-							mode := gateway_api.TLSModeTerminate
-							var tlsConfig gateway_api.GatewayTLSConfig
-
-							if tt.noTLSOption {
-								tlsConfig = gateway_api.GatewayTLSConfig{
-									Mode: &mode,
-								}
-
-							} else {
-
-								tlsConfig = gateway_api.GatewayTLSConfig{
-									Mode:    &mode,
-									Options: make(map[gateway_api.AnnotationKey]gateway_api.AnnotationValue),
-								}
-
-								if tt.wrongTLSOption {
-									tlsConfig.Options["wrong-annotation"] = gateway_api.AnnotationValue(tt.certARN)
-
-								} else {
-									tlsConfig.Options[awsCustomCertARN] = gateway_api.AnnotationValue(tt.certARN)
-								}
+							listener.Protocol = "HTTPS"
+							mode := gwv1.TLSModeTerminate
+							listener.TLS = &gwv1beta1.GatewayTLSConfig{
+								Mode: &mode,
 							}
-							listener.TLS = &tlsConfig
-
 						}
+
 						gw.Spec.Listeners = append(gw.Spec.Listeners, listener)
 						return nil
-					} else {
-						return errors.New("unknown k8s object")
-					}
-				},
-			)
-		}
+					},
+				)
+			}
 
-		ds := latticestore.NewLatticeDataStore()
+			stack := core.NewDefaultStack(core.StackID(k8s.NamespacedName(tt.route.K8sObject())))
 
-		stack := core.NewDefaultStack(core.StackID(k8s.NamespacedName(tt.httpRoute)))
+			task := &latticeServiceModelBuildTask{
+				log:    gwlog.FallbackLogger,
+				route:  tt.route,
+				client: mockK8sClient,
+				stack:  stack,
+			}
 
-		task := &latticeServiceModelBuildTask{
-			httpRoute:       tt.httpRoute,
-			stack:           stack,
-			Client:          k8sClient,
-			listenerByResID: make(map[string]*latticemodel.Listener),
-			Datastore:       ds,
-		}
+			err := task.buildListeners(ctx, "svc-id")
 
-		service := latticemodel.Service{}
-		task.latticeService = &service
+			if !tt.wantErrIsNil {
+				assert.NotNil(t, err)
+				return
+			}
 
-		err := task.buildListener(ctx)
-
-		fmt.Printf("task.buildListener err: %v \n", err)
-
-		if !tt.wantErrIsNil {
-			// TODO why following is failing????
-			//assert.Equal(t, err!=nil, true)
-			//assert.Error(t, err)
-			fmt.Printf("task.buildListener tt : %v err: %v %v\n", tt.name, err, err != nil)
-			continue
-		} else {
 			assert.NoError(t, err)
-		}
 
-		fmt.Printf("listeners %v\n", task.listenerByResID)
-		fmt.Printf("task : %v stack %v\n", task, stack)
-		var resListener []*latticemodel.Listener
+			var resListener []*model.Listener
+			stack.ListResources(&resListener)
 
-		stack.ListResources(&resListener)
+			assert.Equal(t, len(tt.expectedSpec), len(resListener))
 
-		fmt.Printf("resListener :%v \n", resListener)
-		assert.Equal(t, resListener[0].Spec.Port, int64(tt.gwListenerPort))
-		assert.Equal(t, resListener[0].Spec.Name, tt.httpRoute.ObjectMeta.Name)
-		assert.Equal(t, resListener[0].Spec.Namespace, tt.httpRoute.ObjectMeta.Namespace)
-		assert.Equal(t, resListener[0].Spec.Protocol, "HTTP")
+			for i, expected := range tt.expectedSpec {
+				actual := resListener[i].Spec
 
-		assert.Equal(t, resListener[0].Spec.DefaultAction.BackendServiceName,
-			string(tt.httpRoute.Spec.Rules[0].BackendRefs[0].BackendRef.Name))
-		if ns := tt.httpRoute.Spec.Rules[0].BackendRefs[0].BackendRef.Namespace; ns != nil {
-			assert.Equal(t, resListener[0].Spec.DefaultAction.BackendServiceNamespace, *ns)
-		} else {
-			assert.Equal(t, resListener[0].Spec.DefaultAction.BackendServiceNamespace, tt.httpRoute.ObjectMeta.Namespace)
-		}
-
-		if *tt.httpRoute.Spec.Rules[0].BackendRefs[0].Kind == "Service" {
-			assert.Equal(t, resListener[0].Spec.DefaultAction.Is_Import, false)
-		} else {
-			assert.Equal(t, resListener[0].Spec.DefaultAction.Is_Import, true)
-		}
-
-		if tt.tlsTerminate && !tt.noTLSOption && !tt.wrongTLSOption {
-			assert.Equal(t, task.latticeService.Spec.CustomerCertARN, tt.certARN)
-		} else {
-			assert.Equal(t, task.latticeService.Spec.CustomerCertARN, "")
-		}
-
+				assert.Equal(t, expected.StackServiceId, actual.StackServiceId)
+				assert.Equal(t, expected.K8SRouteName, actual.K8SRouteName)
+				assert.Equal(t, expected.K8SRouteNamespace, actual.K8SRouteNamespace)
+				assert.Equal(t, expected.Port, actual.Port)
+				assert.Equal(t, expected.Protocol, actual.Protocol)
+			}
+		})
 	}
 }

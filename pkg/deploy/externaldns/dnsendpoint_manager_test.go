@@ -3,9 +3,12 @@ package externaldns
 import (
 	"context"
 	"errors"
-	"fmt"
+	"testing"
+
 	mock_client "github.com/aws/aws-application-networking-k8s/mocks/controller-runtime/client"
-	latticemodel "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
+	model "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
+	"github.com/aws/aws-application-networking-k8s/pkg/utils/gwlog"
+
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -14,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/external-dns/endpoint"
-	"testing"
 )
 
 func TestCreateDnsEndpoint(t *testing.T) {
@@ -23,7 +25,7 @@ func TestCreateDnsEndpoint(t *testing.T) {
 
 	tests := []struct {
 		name             string
-		service          latticemodel.Service
+		service          model.Service
 		existingEndpoint endpoint.DNSEndpoint
 		routeGetErr      error
 		dnsGetErr        error
@@ -35,42 +37,48 @@ func TestCreateDnsEndpoint(t *testing.T) {
 	}{
 		{
 			name: "No customer domain name - skips creation",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "lattice-internal-domain",
+				Status: &model.ServiceStatus{
+					Dns: "lattice-internal-domain",
 				},
 			},
 			errIsNil: true,
 		},
 		{
 			name: "No service dns - skips creation",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "custom-domain",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "",
+				Status: &model.ServiceStatus{
+					Dns: "",
 				},
 			},
 			errIsNil: true,
 		},
 		{
 			name: "No parent route - skips creation",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "custom-domain",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "lattice-internal-domain",
+				Status: &model.ServiceStatus{
+					Dns: "lattice-internal-domain",
 				},
 			},
 			routeGetErr: errors.New("No HTTPRoute found"),
@@ -78,14 +86,16 @@ func TestCreateDnsEndpoint(t *testing.T) {
 		},
 		{
 			name: "Create new DNSEndpoint if not existing already",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "custom-domain",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "lattice-internal-domain",
+				Status: &model.ServiceStatus{
+					Dns: "lattice-internal-domain",
 				},
 			},
 			dnsGetErr: apierrors.NewNotFound(schema.GroupResource{}, ""),
@@ -94,14 +104,16 @@ func TestCreateDnsEndpoint(t *testing.T) {
 		},
 		{
 			name: "Return error on creation failure",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "custom-domain",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "lattice-internal-domain",
+				Status: &model.ServiceStatus{
+					Dns: "lattice-internal-domain",
 				},
 			},
 			dnsGetErr:    apierrors.NewNotFound(schema.GroupResource{}, ""),
@@ -111,14 +123,16 @@ func TestCreateDnsEndpoint(t *testing.T) {
 		},
 		{
 			name: "Update DNSEndpoint if existing already",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "custom-domain",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "lattice-internal-domain",
+				Status: &model.ServiceStatus{
+					Dns: "lattice-internal-domain",
 				},
 			},
 			existingEndpoint: endpoint.DNSEndpoint{
@@ -138,14 +152,16 @@ func TestCreateDnsEndpoint(t *testing.T) {
 		},
 		{
 			name: "DNSEndpoint existing already, but skip if it is the same",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "custom-domain",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "lattice-internal-domain",
+				Status: &model.ServiceStatus{
+					Dns: "lattice-internal-domain",
 				},
 			},
 			existingEndpoint: endpoint.DNSEndpoint{
@@ -165,14 +181,16 @@ func TestCreateDnsEndpoint(t *testing.T) {
 		},
 		{
 			name: "Return error on update failure",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "custom-domain",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "lattice-internal-domain",
+				Status: &model.ServiceStatus{
+					Dns: "lattice-internal-domain",
 				},
 			},
 			existingEndpoint: endpoint.DNSEndpoint{
@@ -193,14 +211,16 @@ func TestCreateDnsEndpoint(t *testing.T) {
 		},
 		{
 			name: "Skips creation when DNSEndpoint CRD is not found",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "custom-domain",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "lattice-internal-domain",
+				Status: &model.ServiceStatus{
+					Dns: "lattice-internal-domain",
 				},
 			},
 			dnsGetErr: &meta.NoKindMatchError{
@@ -211,14 +231,16 @@ func TestCreateDnsEndpoint(t *testing.T) {
 		},
 		{
 			name: "Return error on unexpected lookup failure",
-			service: latticemodel.Service{
-				Spec: latticemodel.ServiceSpec{
-					Name:               "service",
-					Namespace:          "default",
+			service: model.Service{
+				Spec: model.ServiceSpec{
+					ServiceTagFields: model.ServiceTagFields{
+						RouteName:      "service",
+						RouteNamespace: "default",
+					},
 					CustomerDomainName: "custom-domain",
 				},
-				Status: &latticemodel.ServiceStatus{
-					ServiceDNS: "lattice-internal-domain",
+				Status: &model.ServiceStatus{
+					Dns: "lattice-internal-domain",
 				},
 			},
 			dnsGetErr: errors.New("Unhandled exception"),
@@ -227,43 +249,44 @@ func TestCreateDnsEndpoint(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		fmt.Printf("Testing >>>>> %v\n", tt.name)
-		client := mock_client.NewMockClient(c)
-		mgr := NewDnsEndpointManager(client)
+		t.Run(tt.name, func(t *testing.T) {
+			mockClient := mock_client.NewMockClient(c)
+			mgr := NewDnsEndpointManager(gwlog.FallbackLogger, mockClient)
 
-		client.EXPECT().Scheme().Return(runtime.NewScheme()).AnyTimes()
+			mockClient.EXPECT().Scheme().Return(runtime.NewScheme()).AnyTimes()
 
-		client.EXPECT().Get(gomock.Any(), gomock.Eq(types.NamespacedName{
-			Namespace: tt.service.Spec.Namespace,
-			Name:      tt.service.Spec.Name,
-		}), gomock.Any()).Return(tt.routeGetErr).AnyTimes()
+			mockClient.EXPECT().Get(gomock.Any(), gomock.Eq(types.NamespacedName{
+				Namespace: tt.service.Spec.RouteNamespace,
+				Name:      tt.service.Spec.RouteName,
+			}), gomock.Any()).Return(tt.routeGetErr).AnyTimes()
 
-		client.EXPECT().Get(gomock.Any(), gomock.Eq(types.NamespacedName{
-			Namespace: tt.service.Spec.Namespace,
-			Name:      tt.service.Spec.Name + "-dns",
-		}), gomock.Any()).DoAndReturn(func(ctx context.Context, name types.NamespacedName, ep *endpoint.DNSEndpoint, _ ...interface{}) error {
-			tt.existingEndpoint.DeepCopyInto(ep)
-			return tt.dnsGetErr
-		}).AnyTimes()
+			mockClient.EXPECT().Get(gomock.Any(), gomock.Eq(types.NamespacedName{
+				Namespace: tt.service.Spec.RouteNamespace,
+				Name:      tt.service.Spec.RouteName + "-dns",
+			}), gomock.Any()).DoAndReturn(func(ctx context.Context, name types.NamespacedName, ep *endpoint.DNSEndpoint, _ ...interface{}) error {
+				tt.existingEndpoint.DeepCopyInto(ep)
+				return tt.dnsGetErr
+			}).AnyTimes()
 
-		createCall := client.EXPECT().Create(gomock.Any(), gomock.Any()).Return(tt.dnsCreateErr)
-		if tt.created {
-			createCall.Times(1)
-		} else {
-			createCall.Times(0)
-		}
-		patchCall := client.EXPECT().Patch(gomock.Any(), gomock.Any(), gomock.Any()).Return(tt.dnsUpdateErr)
-		if tt.updated {
-			patchCall.Times(1)
-		} else {
-			patchCall.Times(0)
-		}
+			createCall := mockClient.EXPECT().Create(gomock.Any(), gomock.Any()).Return(tt.dnsCreateErr)
+			if tt.created {
+				createCall.Times(1)
+			} else {
+				createCall.Times(0)
+			}
+			patchCall := mockClient.EXPECT().Patch(gomock.Any(), gomock.Any(), gomock.Any()).Return(tt.dnsUpdateErr)
+			if tt.updated {
+				patchCall.Times(1)
+			} else {
+				patchCall.Times(0)
+			}
 
-		err := mgr.Create(context.Background(), &tt.service)
-		if tt.errIsNil {
-			assert.Nil(t, err)
-		} else {
-			assert.Error(t, err)
-		}
+			err := mgr.Create(context.Background(), &tt.service)
+			if tt.errIsNil {
+				assert.Nil(t, err)
+			} else {
+				assert.Error(t, err)
+			}
+		})
 	}
 }

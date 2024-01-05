@@ -7,13 +7,32 @@ strict: true
 
 nav:
   - Home: index.md
-  - Deployment: deploy.md
-  - Get Started: getstarted.md
-  - Configuration:
-    - Overview: configure/index.md
-    - Configure HTTPs: configure/https.md
-    - Configure domain name: configure/customer_domain_name.md
-  - Design Overview: overview.md
+  - User Guides:
+    - Quick Start: guides/deploy.md
+    - Basic Setup: guides/getstarted.md
+    - Configuration: guides/environment.md
+  - Concepts:
+    - Design Overview: concepts/overview.md
+    - TLS: concepts/https.md
+    - Custom Domain Name: concepts/custom-domain-name.md
+    - GRPC: concepts/grpc.md
+    - Cross-Account Sharing: concepts/ram-sharing.md
+  - API Specification: api-reference.md
+  - API Reference:
+    - AccessLogPolicy: api-types/access-log-policy.md
+    - Gateway: api-types/gateway.md
+    - GRPCRoute: api-types/grpc-route.md
+    - HTTPRoute: api-types/http-route.md
+    - IAMAuthPolicy:  api-types/iam-auth-policy.md
+    - Service: api-types/service.md
+    - ServiceExport: api-types/service-export.md
+    - ServiceImport: api-types/service-import.md
+    - TargetGroupPolicy: api-types/target-group-policy.md
+    - VpcAssociationPolicy: api-types/vpc-association-policy.md
+  - Contributing:
+    - Developer Guide: contributing/developer.md
+    - Developer Cheat Sheet: contributing/developer-cheat-sheet.md
+  - FAQ: faq.md
 
 plugins:
   - search
@@ -39,15 +58,11 @@ markdown_extensions:
   - pymdownx.superfences
   - pymdownx.tabbed
   - pymdownx.emoji:
-      emoji_index: !!python/name:materialx.emoji.twemoji
-      emoji_generator: !!python/name:materialx.emoji.to_svg
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - toc:
       permalink: true
 extra_css:
   - https://unpkg.com/material-components-web@latest/dist/material-components-web.min.css
 extra_javascript:
   - https://unpkg.com/material-components-web@latest/dist/material-components-web.min.js
-
-# Hosted with AWS Amplify
-# Isengard: aws-mercury+gateway-controller-docs@
-# Account Ownership Group: aws-mercury

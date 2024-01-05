@@ -2,62 +2,76 @@ package externaldns
 
 import (
 	"context"
-	latticemodel "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
-	"github.com/golang/glog"
+	"reflect"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/external-dns/endpoint"
-	gateway_api "sigs.k8s.io/gateway-api/apis/v1beta1"
+
+	"github.com/aws/aws-application-networking-k8s/pkg/model/core"
+	latticemodel "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
+	"github.com/aws/aws-application-networking-k8s/pkg/utils/gwlog"
 )
+
+//go:generate mockgen -destination dnsendpoint_manager_mock.go -package externaldns github.com/aws/aws-application-networking-k8s/pkg/deploy/externaldns DnsEndpointManager
 
 type DnsEndpointManager interface {
 	Create(ctx context.Context, service *latticemodel.Service) error
 }
 
 type defaultDnsEndpointManager struct {
+	log       gwlog.Logger
 	k8sClient client.Client
 }
 
-func NewDnsEndpointManager(k8sClient client.Client) *defaultDnsEndpointManager {
+func NewDnsEndpointManager(log gwlog.Logger, k8sClient client.Client) *defaultDnsEndpointManager {
 	return &defaultDnsEndpointManager{
+		log:       log,
 		k8sClient: k8sClient,
 	}
 }
 
 func (s *defaultDnsEndpointManager) Create(ctx context.Context, service *latticemodel.Service) error {
 	namespacedName := types.NamespacedName{
-		Namespace: service.Spec.Namespace,
-		Name:      service.Spec.Name + "-dns",
+		Namespace: service.Spec.RouteNamespace,
+		Name:      service.Spec.RouteName + "-dns",
 	}
 	if service.Spec.CustomerDomainName == "" {
-		glog.V(2).Infof("Skipping creation of %s: detected no custom domain", namespacedName.String())
+		s.log.Debugf("Skipping creation of %s: detected no custom domain", namespacedName)
 		return nil
 	}
-	if service.Status == nil || service.Status.ServiceDNS == "" {
-		glog.V(2).Infof("Skipping creation of %s: DNS target not ready in svc status", namespacedName.String())
+	if service.Status == nil || service.Status.Dns == "" {
+		s.log.Debugf("Skipping creation of %s: DNS target not ready in svc status", namespacedName)
 		return nil
 	}
 
-	httproute := &gateway_api.HTTPRoute{}
+	var (
+		route core.Route
+		err   error
+	)
 	routeNamespacedName := types.NamespacedName{
-		Namespace: service.Spec.Namespace,
-		Name:      service.Spec.Name,
+		Namespace: service.Spec.RouteNamespace,
+		Name:      service.Spec.RouteName,
 	}
-	if err := s.k8sClient.Get(ctx, routeNamespacedName, httproute); err != nil {
-		glog.V(2).Infof("Skipping creation of %s: Could not find corresponding route", namespacedName.String())
+	if service.Spec.RouteType == core.GrpcRouteType {
+		route, err = core.GetGRPCRoute(ctx, s.k8sClient, routeNamespacedName)
+	} else {
+		route, err = core.GetHTTPRoute(ctx, s.k8sClient, routeNamespacedName)
+	}
+	if err != nil {
+		s.log.Debugf("Skipping creation of %s: Could not find corresponding route", namespacedName.String())
 		return nil
 	}
 
 	ep := &endpoint.DNSEndpoint{}
 	if err := s.k8sClient.Get(ctx, namespacedName, ep); err != nil {
 		if apierrors.IsNotFound(err) {
-			glog.V(2).Infof("Attempting creation of DNSEndpoint for %s - %s -> %s",
-				namespacedName.String(), service.Spec.CustomerDomainName, service.Status.ServiceDNS)
+			s.log.Debugf("Attempting creation of DNSEndpoint for %s - %s -> %s",
+				namespacedName.String(), service.Spec.CustomerDomainName, service.Status.Dns)
 			ep = &endpoint.DNSEndpoint{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      namespacedName.Name,
@@ -68,7 +82,7 @@ func (s *defaultDnsEndpointManager) Create(ctx context.Context, service *lattice
 						{
 							DNSName: service.Spec.CustomerDomainName,
 							Targets: []string{
-								service.Status.ServiceDNS,
+								service.Status.Dns,
 							},
 							RecordType: "CNAME",
 							RecordTTL:  300,
@@ -76,27 +90,25 @@ func (s *defaultDnsEndpointManager) Create(ctx context.Context, service *lattice
 					},
 				},
 			}
-			controllerutil.SetControllerReference(httproute, ep, s.k8sClient.Scheme())
+			controllerutil.SetControllerReference(route.K8sObject(), ep, s.k8sClient.Scheme())
 			if err = s.k8sClient.Create(ctx, ep); err != nil {
-				glog.V(2).Infof("Failed creating DNSEndpoint: %s", err.Error())
 				return err
 			}
 		} else if meta.IsNoMatchError(err) {
-			glog.V(2).Infof("DNSEndpoint CRD not supported, skipping")
+			s.log.Debugf("DNSEndpoint CRD not supported, skipping")
 			return nil
 		} else {
-			glog.V(2).Infof("Failed lookup of DNSEndpoint: %s", err.Error())
 			return err
 		}
 	} else {
-		glog.V(2).Infof("Attempting update of DNSEndpoint for %s - %s -> %s",
-			namespacedName.String(), service.Spec.CustomerDomainName, service.Status.ServiceDNS)
+		s.log.Debugf("Attempting update of DNSEndpoint for %s - %s -> %s",
+			namespacedName.String(), service.Spec.CustomerDomainName, service.Status.Dns)
 		old := ep.DeepCopy()
 		ep.Spec.Endpoints = []*endpoint.Endpoint{
 			{
 				DNSName: service.Spec.CustomerDomainName,
 				Targets: []string{
-					service.Status.ServiceDNS,
+					service.Status.Dns,
 				},
 				RecordType: "CNAME",
 				RecordTTL:  300,
@@ -104,7 +116,6 @@ func (s *defaultDnsEndpointManager) Create(ctx context.Context, service *lattice
 		}
 		if !reflect.DeepEqual(ep.Spec.Endpoints, old.Spec.Endpoints) {
 			if err = s.k8sClient.Patch(ctx, ep, client.MergeFrom(old)); err != nil {
-				glog.V(2).Infof("Failed updating DNSEndpoint: %s", err.Error())
 				return err
 			}
 		}

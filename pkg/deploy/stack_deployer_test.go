@@ -2,229 +2,73 @@ package deploy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
+	"time"
 
-	mock_client "github.com/aws/aws-application-networking-k8s/mocks/controller-runtime/client"
-	mocks_aws "github.com/aws/aws-application-networking-k8s/pkg/aws"
-	"github.com/aws/aws-application-networking-k8s/pkg/deploy/lattice"
-	"github.com/aws/aws-application-networking-k8s/pkg/latticestore"
-	"github.com/golang/mock/gomock"
+	"github.com/aws/aws-application-networking-k8s/pkg/utils/gwlog"
 	"github.com/stretchr/testify/assert"
-	"k8s.io/apimachinery/pkg/types"
-
-	"github.com/aws/aws-application-networking-k8s/pkg/deploy/externaldns"
-	"github.com/aws/aws-application-networking-k8s/pkg/model/core"
-	latticemodel "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
 )
 
-func Test_latticeServiceStackDeployer_createAllResources(t *testing.T) {
-	c := gomock.NewController(t)
-	defer c.Finish()
+func TestTgGc(t *testing.T) {
 
-	mockClient := mock_client.NewMockClient(c)
-
-	mockCloud := mocks_aws.NewMockCloud(c)
-
-	mockServiceManager := lattice.NewMockServiceManager(c)
-
-	mockTargetGroupManager := lattice.NewMockTargetGroupManager(c)
-
-	mockListenerManager := lattice.NewMockListenerManager(c)
-
-	mockRuleManager := lattice.NewMockRuleManager(c)
-
-	mockDnsManager := externaldns.NewMockDnsEndpointManager(c)
-
-	mockTargetsManager := lattice.NewMockTargetsManager(c)
-
-	mockLatticeDataStore := latticestore.NewLatticeDataStore()
-
-	ctx := context.TODO()
-
-	s := core.NewDefaultStack(core.StackID(types.NamespacedName{Namespace: "tt", Name: "name"}))
-
-	latticemodel.NewLatticeService(s, "fake-service", latticemodel.ServiceSpec{})
-	latticemodel.NewTargetGroup(s, "fake-targetGroup", latticemodel.TargetGroupSpec{})
-	latticemodel.NewTargets(s, "fake-target", latticemodel.TargetsSpec{})
-	latticemodel.NewListener(s, "fake-listener", 8080, "HTTP", "service1", "default", latticemodel.DefaultAction{})
-	latticemodel.NewRule(s, "fake-rule", "fake-rule", "default", 80, "HTTP", latticemodel.RuleAction{}, latticemodel.RuleSpec{})
-
-	mockTargetGroupManager.EXPECT().List(gomock.Any()).AnyTimes()
-	mockListenerManager.EXPECT().List(gomock.Any(), gomock.Any()).AnyTimes()
-
-	mockServiceManager.EXPECT().Create(gomock.Any(), gomock.Any())
-	mockTargetGroupManager.EXPECT().Create(gomock.Any(), gomock.Any()).AnyTimes()
-	mockTargetsManager.EXPECT().Create(gomock.Any(), gomock.Any())
-	mockListenerManager.EXPECT().Create(gomock.Any(), gomock.Any())
-	mockRuleManager.EXPECT().Create(gomock.Any(), gomock.Any())
-	mockDnsManager.EXPECT().Create(gomock.Any(), gomock.Any())
-
-	deployer := &latticeServiceStackDeployer{
-		cloud:                 mockCloud,
-		k8sclient:             mockClient,
-		latticeServiceManager: mockServiceManager,
-		targetGroupManager:    mockTargetGroupManager,
-		listenerManager:       mockListenerManager,
-		ruleManager:           mockRuleManager,
-		targetsManager:        mockTargetsManager,
-		dnsEndpointManager:    mockDnsManager,
-		latticeDataStore:      mockLatticeDataStore,
+	type test struct {
+		name string
+		gcFn TgGcCycleFn
 	}
 
-	err := deployer.Deploy(ctx, s)
-
-	assert.Nil(t, err)
-}
-
-func Test_latticeServiceStackDeployer_CreateJustService(t *testing.T) {
-	c := gomock.NewController(t)
-	defer c.Finish()
-
-	mockClient := mock_client.NewMockClient(c)
-
-	mockCloud := mocks_aws.NewMockCloud(c)
-
-	mockServiceManager := lattice.NewMockServiceManager(c)
-
-	mockTargetGroupManager := lattice.NewMockTargetGroupManager(c)
-
-	mockTargetsManager := lattice.NewMockTargetsManager(c)
-
-	mockListenerManager := lattice.NewMockListenerManager(c)
-
-	mockRuleManager := lattice.NewMockRuleManager(c)
-
-	mockDnsManager := externaldns.NewMockDnsEndpointManager(c)
-
-	mockLatticeDataStore := latticestore.NewLatticeDataStore()
-
-	ctx := context.TODO()
-
-	mockTargetGroupManager.EXPECT().List(gomock.Any())
-	mockListenerManager.EXPECT().List(gomock.Any(), gomock.Any())
-
-	mockServiceManager.EXPECT().Create(gomock.Any(), gomock.Any())
-	mockDnsManager.EXPECT().Create(gomock.Any(), gomock.Any())
-
-	s := core.NewDefaultStack(core.StackID(types.NamespacedName{Namespace: "tt", Name: "name"}))
-
-	latticemodel.NewLatticeService(s, "fake-service", latticemodel.ServiceSpec{})
-
-	deployer := &latticeServiceStackDeployer{
-		cloud:                 mockCloud,
-		k8sclient:             mockClient,
-		latticeServiceManager: mockServiceManager,
-		targetGroupManager:    mockTargetGroupManager,
-		targetsManager:        mockTargetsManager,
-		listenerManager:       mockListenerManager,
-		ruleManager:           mockRuleManager,
-		dnsEndpointManager:    mockDnsManager,
-		latticeDataStore:      mockLatticeDataStore,
+	tests := []test{
+		{
+			name: "empty cycle",
+			gcFn: func(context.Context) (TgGcResult, error) { return TgGcResult{}, nil },
+		},
+		{
+			name: "cycle with results",
+			gcFn: func(context.Context) (TgGcResult, error) {
+				return TgGcResult{
+					att:      10,
+					succ:     10,
+					duration: time.Second,
+				}, nil
+			},
+		},
+		{
+			name: "cycle panic",
+			gcFn: func(context.Context) (TgGcResult, error) { panic("") },
+		},
+		{
+			name: "cycle error",
+			gcFn: func(context.Context) (TgGcResult, error) { return TgGcResult{}, errors.New("") },
+		},
 	}
 
-	err := deployer.Deploy(ctx, s)
+	nCycles := 10 // run each test at least 10 cycles
 
-	assert.Nil(t, err)
-}
-
-func Test_latticeServiceStackDeployer_DeleteService(t *testing.T) {
-	c := gomock.NewController(t)
-	defer c.Finish()
-
-	mockClient := mock_client.NewMockClient(c)
-
-	mockCloud := mocks_aws.NewMockCloud(c)
-
-	mockServiceManager := lattice.NewMockServiceManager(c)
-
-	mockTargetGroupManager := lattice.NewMockTargetGroupManager(c)
-
-	mockListenerManager := lattice.NewMockListenerManager(c)
-
-	mockRuleManager := lattice.NewMockRuleManager(c)
-
-	mockTargetsManager := lattice.NewMockTargetsManager(c)
-
-	mockLatticeDataStore := latticestore.NewLatticeDataStore()
-
-	ctx := context.TODO()
-
-	s := core.NewDefaultStack(core.StackID(types.NamespacedName{Namespace: "tt", Name: "name"}))
-
-	latticemodel.NewLatticeService(s, "fake-service", latticemodel.ServiceSpec{
-		IsDeleted: true,
-	})
-
-	mockTargetGroupManager.EXPECT().List(gomock.Any()).AnyTimes()
-	mockListenerManager.EXPECT().List(gomock.Any(), gomock.Any()).AnyTimes()
-
-	mockServiceManager.EXPECT().Delete(gomock.Any(), gomock.Any())
-
-	deployer := &latticeServiceStackDeployer{
-		cloud:                 mockCloud,
-		k8sclient:             mockClient,
-		latticeServiceManager: mockServiceManager,
-		targetGroupManager:    mockTargetGroupManager,
-		listenerManager:       mockListenerManager,
-		ruleManager:           mockRuleManager,
-		targetsManager:        mockTargetsManager,
-		latticeDataStore:      mockLatticeDataStore,
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			n := 0
+			f := func(ctx context.Context) (TgGcResult, error) {
+				defer func() {
+					n += 1
+					if n >= nCycles {
+						cancel()
+					}
+				}()
+				return tt.gcFn(ctx)
+			}
+			ivl := time.Millisecond * 10
+			tgGc := &TgGc{
+				log:     gwlog.FallbackLogger,
+				ctx:     ctx,
+				ivl:     ivl,
+				cycleFn: f,
+			}
+			tgGc.start()
+			time.Sleep(ivl * (time.Duration(nCycles) + 2)) // sleep enough cycles to terminate
+			assert.Equal(t, nCycles, n, fmt.Sprintf("should run only %d cycles", nCycles))
+			assert.True(t, tgGc.isDone.Load(), "gc must terminate")
+		})
 	}
-
-	err := deployer.Deploy(ctx, s)
-
-	assert.Nil(t, err)
-}
-
-func Test_latticeServiceStackDeployer_DeleteAllResources(t *testing.T) {
-	c := gomock.NewController(t)
-	defer c.Finish()
-
-	mockClient := mock_client.NewMockClient(c)
-
-	mockCloud := mocks_aws.NewMockCloud(c)
-
-	mockServiceManager := lattice.NewMockServiceManager(c)
-
-	mockTargetGroupManager := lattice.NewMockTargetGroupManager(c)
-
-	mockListenerManager := lattice.NewMockListenerManager(c)
-
-	mockRuleManager := lattice.NewMockRuleManager(c)
-
-	mockTargetsManager := lattice.NewMockTargetsManager(c)
-
-	mockLatticeDataStore := latticestore.NewLatticeDataStore()
-
-	ctx := context.TODO()
-
-	s := core.NewDefaultStack(core.StackID(types.NamespacedName{Namespace: "tt", Name: "name"}))
-
-	latticemodel.NewLatticeService(s, "fake-service", latticemodel.ServiceSpec{
-		IsDeleted: true,
-	})
-	latticemodel.NewTargetGroup(s, "fake-targetGroup", latticemodel.TargetGroupSpec{
-		IsDeleted: true,
-	})
-
-	mockTargetGroupManager.EXPECT().List(gomock.Any()).AnyTimes()
-	mockListenerManager.EXPECT().List(gomock.Any(), gomock.Any()).AnyTimes()
-
-	mockServiceManager.EXPECT().Delete(gomock.Any(), gomock.Any())
-	mockTargetGroupManager.EXPECT().Delete(gomock.Any(), gomock.Any())
-
-	deployer := &latticeServiceStackDeployer{
-		cloud:                 mockCloud,
-		k8sclient:             mockClient,
-		latticeServiceManager: mockServiceManager,
-		targetGroupManager:    mockTargetGroupManager,
-		listenerManager:       mockListenerManager,
-		ruleManager:           mockRuleManager,
-		targetsManager:        mockTargetsManager,
-		latticeDataStore:      mockLatticeDataStore,
-	}
-
-	err := deployer.Deploy(ctx, s)
-
-	assert.Nil(t, err)
 }

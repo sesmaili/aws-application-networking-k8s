@@ -1,12 +1,16 @@
-export KUBEBUILDER_ASSETS ?= ${HOME}/.kubebuilder/bin
-export CLUSTER_NAME ?= $(shell kubectl config view --minify -o jsonpath='{.clusters[].name}' | rev | cut -d"/" -f1 | rev | cut -d"." -f1)
-export CLUSTER_VPC_ID ?= $(shell aws eks describe-cluster --name $(CLUSTER_NAME) | jq -r ".cluster.resourcesVpcConfig.vpcId")
-export AWS_ACCOUNT_ID ?= $(shell aws sts get-caller-identity --query Account --output text)
-export REGION ?= $(shell aws configure get region)
+# For all targets except `help` and default target (which is also `help`), export environment variables
+ifneq (,$(filter-out help,$(MAKECMDGOALS)))
+	export KUBEBUILDER_ASSETS ?= ${HOME}/.kubebuilder/bin
+	export CLUSTER_NAME ?= $(shell kubectl config view --minify -o jsonpath='{.clusters[].name}' | rev | cut -d"/" -f1 | rev | cut -d"." -f1)
+	export CLUSTER_VPC_ID ?= $(shell aws eks describe-cluster --name $(CLUSTER_NAME) | jq -r ".cluster.resourcesVpcConfig.vpcId")
+	export AWS_ACCOUNT_ID ?= $(shell aws sts get-caller-identity --query Account --output text)
+	export REGION ?= $(shell aws configure get region)
+endif
+
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
-VERSION ?= $(shell git tag --sort=committerdate | tail -1)
-ECRIMAGES ?=public.ecr.aws/m7r9p7b3/aws-gateway-controller:${VERSION}
+VERSION ?= $(if $(RELEASE_VERSION),$(RELEASE_VERSION),$(shell git tag --sort=v:refname | tail -1))
+ECRIMAGES ?=public.ecr.aws/aws-application-networking-k8s/aws-gateway-controller:${VERSION}
 
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.22
@@ -45,11 +49,11 @@ help: ## Display this help.
 
 .PHONY: run
 run: ## Run in development mode
-	go run main.go
+	DEV_MODE=1 LOG_LEVEL=debug go run cmd/aws-application-networking-k8s/main.go
 
 
 .PHONY: presubmit
-presubmit: vet test ## Run all commands before submitting code
+presubmit: manifest vet lint test ## Run all commands before submitting code
 
 .PHONY: vet
 vet: ## Vet the code and dependencies
@@ -62,6 +66,19 @@ vet: ## Vet the code and dependencies
 		if [ "${CI}" = true ]; then\
 			exit 1;\
 		fi;}
+	cd test && go vet ./...
+
+
+.PHONY: lint
+lint: ## Run the golangci-lint only in local machine
+	if command -v golangci-lint &> /dev/null; then \
+		echo "Running golangci-lint"; \
+		golangci-lint run; \
+	else \
+		echo "Error: golangci-lint is not installed. Please run the 'make toolchain'"; \
+		exit 1; \
+	fi \
+
 
 .PHONY: test
 test: ## Run tests.
@@ -70,8 +87,6 @@ test: ## Run tests.
 .PHONY: toolchain
 toolchain: ## Install developer toolchain
 	./hack/toolchain.sh
-	./setup.sh
-	./scripts/gen_mocks.sh
 
 ##@ Deployment
 
@@ -88,15 +103,43 @@ build-deploy: ## Create a deployment file that can be applied with `kubectl appl
 	cd config/manager && kustomize edit set image controller=${ECRIMAGES}
 	kustomize build config/default > deploy.yaml
 
-## Run e2e tests against cluster pointed to by ~/.kube/config
-.PHONY: e2etest
-e2etest:
+.PHONY: manifest
+manifest: ## Generate CRD manifest
+	go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.13.0 object paths=./pkg/apis/...
+	go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.13.0 crd paths=./pkg/apis/... output:crd:artifacts:config=config/crds/bases
+	go run k8s.io/code-generator/cmd/register-gen@v0.28.0 --input-dirs ./pkg/apis/applicationnetworking/v1alpha1 --output-base ./ --go-header-file hack/boilerplate.go.txt
+	cp config/crds/bases/application-networking.k8s.aws* helm/crds
+
+e2e-test-namespace := "e2e-test"
+
+.PHONY: e2e-test
+e2e-test: ## Run e2e tests against cluster pointed to by ~/.kube/config
+	@kubectl create namespace $(e2e-test-namespace) > /dev/null 2>&1 || true # ignore already exists error
+	LOG_LEVEL=debug
 	cd test && go test \
 		-p 1 \
 		-count 1 \
-		-timeout 60m \
+		-timeout 90m \
 		-v \
-		./suites/... \
+		./suites/integration/... \
 		--ginkgo.focus="${FOCUS}" \
-		--ginkgo.timeout=60m \
-		--ginkgo.v
+		--ginkgo.skip="${SKIP}"
+
+.SILENT:
+.PHONY: e2e-clean
+e2e-clean: ## Delete eks resources created in the e2e test namespace
+	@echo -n "Cleaning up e2e tests... "
+	@kubectl delete namespace $(e2e-test-namespace) > /dev/null 2>&1
+	@kubectl create namespace $(e2e-test-namespace) > /dev/null 2>&1
+	@echo "Done!"
+
+.PHONY: api-reference
+api-reference: ## Update documentation in docs/api-reference.md
+	@cd docgen && \
+	gen-crd-api-reference-docs -config config.json -api-dir "../pkg/apis/applicationnetworking/v1alpha1/" -out-file docs.html && \
+	cat api-reference-base.md docs.html > ../docs/api-reference.md
+
+.PHONY: docs
+docs:
+	mkdir -p site
+	mkdocs build

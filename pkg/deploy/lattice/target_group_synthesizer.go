@@ -3,440 +3,383 @@ package lattice
 import (
 	"context"
 	"errors"
-	"strings"
+	"fmt"
 
-	"github.com/golang/glog"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/vpclattice"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	anv1alpha1 "github.com/aws/aws-application-networking-k8s/pkg/apis/applicationnetworking/v1alpha1"
+	"github.com/aws/aws-application-networking-k8s/pkg/gateway"
+	"github.com/aws/aws-application-networking-k8s/pkg/utils/gwlog"
 
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	gateway_api "sigs.k8s.io/gateway-api/apis/v1beta1"
-	mcs_api "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
 
-	lattice_aws "github.com/aws/aws-application-networking-k8s/pkg/aws"
+	pkg_aws "github.com/aws/aws-application-networking-k8s/pkg/aws"
 	"github.com/aws/aws-application-networking-k8s/pkg/config"
-	"github.com/aws/aws-application-networking-k8s/pkg/latticestore"
 	"github.com/aws/aws-application-networking-k8s/pkg/model/core"
-	latticemodel "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
+	model "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
 )
 
-func NewTargetGroupSynthesizer(cloud lattice_aws.Cloud, client client.Client, tgManager TargetGroupManager, stack core.Stack, latticeDataStore *latticestore.LatticeDataStore) *targetGroupSynthesizer {
-	return &targetGroupSynthesizer{
+// helpful for testing/mocking
+func NewTargetGroupSynthesizer(
+	log gwlog.Logger,
+	cloud pkg_aws.Cloud,
+	client client.Client,
+	tgManager TargetGroupManager,
+	svcExportTgBuilder gateway.SvcExportTargetGroupModelBuilder,
+	svcBuilder gateway.LatticeServiceBuilder,
+	stack core.Stack,
+) *TargetGroupSynthesizer {
+	return &TargetGroupSynthesizer{
+		log:                log,
 		cloud:              cloud,
 		client:             client,
 		targetGroupManager: tgManager,
+		svcExportTgBuilder: svcExportTgBuilder,
+		svcBuilder:         svcBuilder,
 		stack:              stack,
-		latticeDataStore:   latticeDataStore,
 	}
 }
 
-type targetGroupSynthesizer struct {
-	cloud              lattice_aws.Cloud
+type TargetGroupSynthesizer struct {
+	log                gwlog.Logger
+	cloud              pkg_aws.Cloud
 	client             client.Client
 	targetGroupManager TargetGroupManager
 	stack              core.Stack
-	latticeDataStore   *latticestore.LatticeDataStore
+	svcExportTgBuilder gateway.SvcExportTargetGroupModelBuilder
+	svcBuilder         gateway.LatticeServiceBuilder
 }
 
-func (t *targetGroupSynthesizer) Synthesize(ctx context.Context) error {
-	var ret = ""
-
-	glog.V(6).Infof("Start synthesizing TargetGroupss ...\n")
-
-	if err := t.SynthesizeTriggeredTargetGroup(ctx); err != nil {
-		ret = LATTICE_RETRY
-	}
-
-	/* TODO,  resolve bug that this might delete other HTTPRoute's TG before they have chance
-	 * to be reconcile during controller restart
-	 */
-	if err := t.SynthesizeSDKTargetGroups(ctx); err != nil {
-		ret = LATTICE_RETRY
-	}
-
-	if ret != "" {
-		return errors.New(ret)
-	} else {
-		return nil
-	}
+func (t *TargetGroupSynthesizer) Synthesize(ctx context.Context) error {
+	err1 := t.SynthesizeCreate(ctx)
+	err2 := t.SynthesizeDelete(ctx)
+	return errors.Join(err1, err2)
 }
-
-func (t *targetGroupSynthesizer) SynthesizeTriggeredTargetGroup(ctx context.Context) error {
-	var resTargetGroups []*latticemodel.TargetGroup
+func (t *TargetGroupSynthesizer) SynthesizeCreate(ctx context.Context) error {
+	var resTargetGroups []*model.TargetGroup
 	var returnErr = false
 
-	t.stack.ListResources(&resTargetGroups)
-
-	glog.V(6).Infof("Synthesize TargetGroups ==[%v]\n", resTargetGroups)
+	err := t.stack.ListResources(&resTargetGroups)
+	if err != nil {
+		return err
+	}
 
 	for _, resTargetGroup := range resTargetGroups {
-
-		// find out VPC for service import
-		if resTargetGroup.Spec.Config.IsServiceImport {
-			/* right now, TG are unique across VPC, we do NOT need to get VPC
-			if resTargetGroup.Spec.Config.EKSClusterName != "" {
-				eksSess := t.cloud.EKS()
-
-				input := &eks.DescribeClusterInput{
-					Name: aws.String(resTargetGroup.Spec.Config.EKSClusterName),
-				}
-				result, err := eksSess.DescribeCluster(input)
-
-				if err != nil {
-					glog.V(6).Infof("Error eks DescribeCluster %v\n", err)
-					returnErr = true
-					continue
-				} else {
-					glog.V(6).Infof("Found VPCID =%s for EKS cluster %s \n", result.String(), resTargetGroup.Spec.Config.EKSClusterName)
-					resTargetGroup.Spec.Config.VpcID = *result.Cluster.ResourcesVpcConfig.VpcId
-					glog.V(6).Infof("targetGroup.Spec.Config.VpcID = %s\n", resTargetGroup.Spec.Config.VpcID)
-				}
-			}
-			// TODO today, targetGroupManager.Create() will list all target and find out the matching one
-			resTargetGroup.Spec.Config.VpcID = resTargetGroup.Spec.Config.VpcID
-			*/
-
-			// TODO in future, we might want to use annotation to specify lattice TG arn or ID
-			if resTargetGroup.Spec.IsDeleted {
-				//Ingnore TG delete since this is an import from elsewhere
-				continue
-			}
-			tgStatus, err := t.targetGroupManager.Get(ctx, resTargetGroup)
-
-			if err != nil {
-				glog.V(6).Infof("Error on t.targetGroupManager.Get for %v err %v\n", resTargetGroup, err)
-				returnErr = true
-				continue
-			}
-
-			// for serviceimport, the httproutename is ""
-
-			t.latticeDataStore.AddTargetGroup(resTargetGroup.Spec.Name,
-				resTargetGroup.Spec.Config.VpcID, tgStatus.TargetGroupARN, tgStatus.TargetGroupID,
-				resTargetGroup.Spec.Config.IsServiceImport, "")
-
-			glog.V(6).Infof("targetGroup Synthesized successfully for %s: %v\n", resTargetGroup.Spec.Name, tgStatus)
-
-		} else {
-			if resTargetGroup.Spec.IsDeleted {
-				err := t.targetGroupManager.Delete(ctx, resTargetGroup)
-
-				if err != nil {
-					returnErr = true
-					continue
-				} else {
-					glog.V(6).Infof("Synthersizing Target Group: successfully deleted target group %v\n", resTargetGroup)
-					t.latticeDataStore.DelTargetGroup(resTargetGroup.Spec.Name, resTargetGroup.Spec.Config.K8SHTTPRouteName, false)
-				}
-
-			} else {
-				resTargetGroup.Spec.Config.VpcID = config.VpcID
-
-				tgStatus, err := t.targetGroupManager.Create(ctx, resTargetGroup)
-
-				if err != nil {
-					glog.V(6).Infof("Error on t.targetGroupManager.Create for %v err %v\n", resTargetGroup, err)
-					returnErr = true
-					continue
-				}
-
-				t.latticeDataStore.AddTargetGroup(resTargetGroup.Spec.Name,
-					resTargetGroup.Spec.Config.VpcID, tgStatus.TargetGroupARN,
-					tgStatus.TargetGroupID, resTargetGroup.Spec.Config.IsServiceImport,
-					resTargetGroup.Spec.Config.K8SHTTPRouteName)
-
-				glog.V(6).Infof("targetGroup Synthesized successfully for %v: %v\n", resTargetGroup.Spec, tgStatus)
-			}
+		if resTargetGroup.IsDeleted {
+			continue
 		}
 
-	}
+		prefix := model.TgNamePrefix(resTargetGroup.Spec)
 
-	glog.V(6).Infof("Done -- SynthesizeTriggeredTargetGroup %v\n", resTargetGroups)
+		tgStatus, err := t.targetGroupManager.Upsert(ctx, resTargetGroup)
+		if err == nil {
+			resTargetGroup.Status = &tgStatus
+		} else {
+			t.log.Debugf("Failed TargetGroupManager.Upsert %s due to %s", prefix, err)
+			returnErr = true
+		}
+	}
 
 	if returnErr {
-		return errors.New("LATTICE-RETRY")
-	} else {
-		return nil
+		return fmt.Errorf("error during target group synthesis, will retry")
 	}
 
+	return nil
+}
+func (t *TargetGroupSynthesizer) SynthesizeDelete(ctx context.Context) error {
+	var resTargetGroups []*model.TargetGroup
+
+	err := t.stack.ListResources(&resTargetGroups)
+	if err != nil {
+		return err
+	}
+
+	var retErr error
+	for _, resTargetGroup := range resTargetGroups {
+		if !resTargetGroup.IsDeleted {
+			continue
+		}
+
+		err := t.targetGroupManager.Delete(ctx, resTargetGroup)
+		if err != nil {
+			prefix := model.TgNamePrefix(resTargetGroup.Spec)
+			retErr = errors.Join(retErr, fmt.Errorf("failed TargetGroupManager.Delete %s due to %s", prefix, err))
+		}
+	}
+
+	if retErr != nil {
+		return retErr
+	}
+	return nil
 }
 
-func (t *targetGroupSynthesizer) SynthesizeSDKTargetGroups(ctx context.Context) error {
+// result of deletion attempt, if err is nil target group was deleted
+type DeleteUnusedResult struct {
+	Arn string
+	Err error
+}
 
-	staleSDKTGs := []latticemodel.TargetGroup{}
-	sdkTGs, err := t.targetGroupManager.List(ctx)
+// This method assumes all synthesis. Returns list of deletion results, might include partial
+// failures if cannot produce list for deletion will return error.
+//
+// TODO: we should do parallel deletion calls, preferably with bounded WorkGroup
+func (t *TargetGroupSynthesizer) SynthesizeUnusedDelete(ctx context.Context) ([]DeleteUnusedResult, error) {
+	tgsToDelete, err := t.calculateTargetGroupsToDelete(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]DeleteUnusedResult, len(tgsToDelete))
+
+	for i, tg := range tgsToDelete {
+		modelStatus := model.TargetGroupStatus{
+			Name: aws.StringValue(tg.tgSummary.Name),
+			Arn:  aws.StringValue(tg.tgSummary.Arn),
+			Id:   aws.StringValue(tg.tgSummary.Id),
+		}
+		modelTg := model.TargetGroup{
+			Status:    &modelStatus,
+			IsDeleted: true,
+		}
+
+		err := t.targetGroupManager.Delete(ctx, &modelTg)
+		results[i] = DeleteUnusedResult{
+			Arn: modelTg.Status.Arn,
+			Err: err,
+		}
+	}
+
+	return results, nil
+}
+
+func (t *TargetGroupSynthesizer) calculateTargetGroupsToDelete(ctx context.Context) ([]tgListOutput, error) {
+	latticeTgs, err := t.targetGroupManager.List(ctx)
+	if err != nil {
+		return latticeTgs, fmt.Errorf("failed TargetGroupManager.List due to %s", err)
+	}
+
+	var tgsToDelete []tgListOutput
+
+	// we check existing target groups to see if they are still in use - this is necessary as
+	// some changes to existing service exports or routes will simply create new target groups,
+	// for example on protocol changes
+	for _, latticeTg := range latticeTgs {
+		if !t.hasTags(latticeTg) || !t.vpcMatchesConfig(latticeTg) {
+			continue
+		}
+
+		// TGs from earlier releases will require 1-time manual cleanup
+		// this method of validation only covers TGs created by this build
+		// of the controller forward
+		tagFields := model.TGTagFieldsFromTags(latticeTg.tags)
+		if !t.hasExpectedTags(latticeTg, tagFields) {
+			continue
+		}
+
+		// most importantly, is the tg in use?
+		if len(latticeTg.tgSummary.ServiceArns) > 0 {
+			t.log.Debugf("TargetGroup %s (%s) is referenced by lattice service",
+				*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+			continue
+		}
+
+		if tagFields.K8SSourceType == model.SourceTypeSvcExport {
+			if t.shouldDeleteSvcExportTg(ctx, latticeTg, tagFields) {
+				tgsToDelete = append(tgsToDelete, latticeTg)
+			}
+		} else {
+			if t.shouldDeleteRouteTg(ctx, latticeTg, tagFields) {
+				tgsToDelete = append(tgsToDelete, latticeTg)
+			}
+		}
+	}
+	return tgsToDelete, nil
+}
+
+func (t *TargetGroupSynthesizer) shouldDeleteSvcExportTg(
+	ctx context.Context, latticeTg tgListOutput, tagFields model.TargetGroupTagFields) bool {
+
+	svcExportName := types.NamespacedName{
+		Namespace: tagFields.K8SServiceNamespace,
+		Name:      tagFields.K8SServiceName,
+	}
+
+	t.log.Debugf("TargetGroup %s (%s) is referenced by ServiceExport",
+		*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+
+	svcExport := &anv1alpha1.ServiceExport{}
+	err := t.client.Get(ctx, svcExportName, svcExport)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// if the service export does not exist, we can safely delete
+			t.log.Infof("Will delete TargetGroup %s (%s) - ServiceExport is not found",
+				*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+			return true
+		} else {
+			// skip if we have an unknown error
+			t.log.Infof("Received unexpected API error getting service export %s", err)
+			return false
+		}
+	}
+
+	if !svcExport.DeletionTimestamp.IsZero() {
+		// backing object is deleted, we can delete too
+		t.log.Infof("Will delete TargetGroup %s (%s) - ServiceExport has been deleted",
+			*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+		return true
+	}
+
+	// now we get to the tricky business of seeing if our unused target group actually matches
+	// the current state of the service and service export - the most correct way to do this is to
+	// reconstruct the target group spec from the service export itself, then compare fields
+	modelTg, err := t.svcExportTgBuilder.BuildTargetGroup(ctx, svcExport)
+	if err != nil {
+		t.log.Infof("Received error building svc export target group model %s", err)
+		return false
+	}
+
+	// the main identifiers are validated, just need to check the other essentials.
+	// protocolVersion is not in TG summary so we are bringing it from tags.
+	if int64(modelTg.Spec.Port) != aws.Int64Value(latticeTg.tgSummary.Port) ||
+		modelTg.Spec.Protocol != aws.StringValue(latticeTg.tgSummary.Protocol) ||
+		modelTg.Spec.ProtocolVersion != tagFields.K8SProtocolVersion ||
+		modelTg.Spec.IpAddressType != aws.StringValue(latticeTg.tgSummary.IpAddressType) {
+
+		// one or more immutable fields differ from the source, so the TG is out of date
+		t.log.Infof("Will delete TargetGroup %s (%s) - fields differ from source service/service export",
+			*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+		return true
+	}
+
+	t.log.Debugf("ServiceExport TargetGroup %s (%s) is up to date",
+		*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+
+	return false
+}
+
+func (t *TargetGroupSynthesizer) shouldDeleteRouteTg(
+	ctx context.Context, latticeTg tgListOutput, tagFields model.TargetGroupTagFields) bool {
+
+	routeName := types.NamespacedName{
+		Namespace: tagFields.K8SRouteNamespace,
+		Name:      tagFields.K8SRouteName,
+	}
+
+	var err error
+	var route core.Route
+	if tagFields.K8SProtocolVersion == vpclattice.TargetGroupProtocolVersionGrpc {
+		route, err = core.GetGRPCRoute(ctx, t.client, routeName)
+	} else {
+		route, err = core.GetHTTPRoute(ctx, t.client, routeName)
+	}
 
 	if err != nil {
-		glog.V(2).Infof("SynthesizeSDKTargetGroups: failed to retrieve sdk TGs %v\n", err)
-		return nil
+		if apierrors.IsNotFound(err) {
+			// if the route does not exist, we can safely delete
+			t.log.Debugf("Will delete TargetGroup %s (%s) - Route is not found",
+				*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+			return true
+		} else {
+			// skip if we have an unknown error
+			t.log.Infof("Received unexpected API error getting route %s", err)
+			return false
+		}
 	}
 
-	glog.V(6).Infof("SynthesizeSDKTargetGroups: here is sdkTGs %v len %v \n", sdkTGs, len(sdkTGs))
-
-	for _, sdkTG := range sdkTGs {
-		tgRouteName := ""
-
-		if *sdkTG.getTargetGroupOutput.Config.VpcIdentifier != config.VpcID {
-			glog.V(6).Infof("Ignore target group ARN %v Name %v for other VPCs",
-				*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-			continue
-		}
-
-		// does target group have K8S tags,  ignore if it is not tagged
-		tgTags := sdkTG.targetGroupTags
-
-		if tgTags == nil || tgTags.Tags == nil {
-			glog.V(6).Infof("Ignore target group not tagged for K8S, %v, %v \n",
-				*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-			continue
-		}
-
-		parentRef, ok := tgTags.Tags[latticemodel.K8SParentRefTypeKey]
-		if !ok || parentRef == nil {
-			glog.V(6).Infof("Ignore target group that have no K8S parentRef tag :%v, %v \n",
-				*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-			continue
-		}
-
-		srvName, ok := tgTags.Tags[latticemodel.K8SServiceNameKey]
-
-		if !ok || srvName == nil {
-			glog.V(6).Infof("Ignore TargetGroup have no servicename tag: %v, %v",
-				*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-			continue
-		}
-
-		srvNamespace, ok := tgTags.Tags[latticemodel.K8SServiceNamespaceKey]
-
-		if !ok || srvNamespace == nil {
-			glog.V(6).Infof("Ignore TargetGroup have no servicenamespace tag: %v, %v",
-				*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-			continue
-		}
-
-		// if its parentref is service export,  check the parent service export exist
-		// Ignore if service export exists
-		if *parentRef == latticemodel.K8SServiceExportType {
-			glog.V(6).Infof("TargetGroup %v, %v is referenced by ServiceExport",
-				*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-
-			glog.V(6).Infof("Determine serviceexport name=%v, namespace=%v exists for targetGroup %v",
-				*srvName, *srvNamespace, *sdkTG.getTargetGroupOutput.Arn)
-
-			srvExportName := types.NamespacedName{
-				Namespace: *srvNamespace,
-				Name:      *srvName,
-			}
-			srvExport := &mcs_api.ServiceExport{}
-			if err := t.client.Get(ctx, srvExportName, srvExport); err == nil {
-
-				glog.V(6).Infof("Ignore TargetGroup(triggered by serviceexport) %v, %v since serviceexport object is found",
-					*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-				continue
-			}
-		}
-
-		// if its parentref is HTTP/route, check the parent HTTPRoute exist
-		// Ignore if httpRoute does NOT exist
-		if *parentRef == latticemodel.K8SHTTPRouteType {
-			glog.V(6).Infof("TargetGroup %v, %v is referenced by HTTPRoute",
-				*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-
-			httpName, ok := tgTags.Tags[latticemodel.K8SHTTPRouteNameKey]
-			tgRouteName = *httpName
-
-			if !ok || httpName == nil {
-				glog.V(6).Infof("Ignore TargetGroup(triggered by httpRoute) %v, %v have no httproute name tag",
-					*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-				continue
-			}
-
-			httpNamespace, ok := tgTags.Tags[latticemodel.K8SHTTPRouteNamespaceKey]
-
-			if !ok || httpNamespace == nil {
-				glog.V(6).Infof("Ignore TargetGroup(triggered by httpRoute) %v, %v have no httproute namespace tag",
-					*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-				continue
-			}
-
-			httprouteName := types.NamespacedName{
-				Namespace: *httpNamespace,
-				Name:      *httpName,
-			}
-
-			httpRoute := &gateway_api.HTTPRoute{}
-
-			tgName := latticestore.TargetGroupName(*srvName, *srvNamespace)
-
-			if err := t.client.Get(ctx, httprouteName, httpRoute); err != nil {
-				glog.V(6).Infof("tgname %v is not used by httproute %v\n", tgName, httpRoute)
-
-			} else {
-
-				isUsed := t.isTargetGroupUsedByaHTTPRoute(ctx, tgName, httpRoute)
-
-				if isUsed {
-
-					glog.V(6).Infof("Ignore TargetGroup(triggered by HTTProute) %v, %v since httproute object is found",
-						*sdkTG.getTargetGroupOutput.Arn, *sdkTG.getTargetGroupOutput.Name)
-
-					continue
-				} else {
-					glog.V(6).Infof("tgname %v is not used by httproute %v\n", tgName, httpRoute)
-				}
-			}
-
-		}
-
-		// the routename for serviceimport is ""
-		if tg, err := t.latticeDataStore.GetTargetGroup(*sdkTG.getTargetGroupOutput.Name, "", true); err == nil {
-			glog.V(6).Infof("Ignore target group created by service import %v\n", tg)
-			continue
-		}
-
-		glog.V(2).Infof("Append stale SDK TG to stale list Name %v, routename %v, ARN %v",
-			*sdkTG.getTargetGroupOutput.Name, tgRouteName, *sdkTG.getTargetGroupOutput.Id)
-
-		staleSDKTGs = append(staleSDKTGs, latticemodel.TargetGroup{
-			Spec: latticemodel.TargetGroupSpec{
-				Name: *sdkTG.getTargetGroupOutput.Name,
-				Config: latticemodel.TargetGroupConfig{
-					K8SHTTPRouteName: tgRouteName,
-				},
-				LatticeID: *sdkTG.getTargetGroupOutput.Id,
-			},
-		})
-
+	if !route.DeletionTimestamp().IsZero() {
+		t.log.Debugf("Will delete TargetGroup %s (%s) - Route is deleted",
+			*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+		return true
 	}
 
-	glog.V(6).Infof("SynthesizeSDKTargetGroups, here is the stale target groups list %v stalelen %d\n", staleSDKTGs, len(staleSDKTGs))
-
-	ret_err := false
-
-	for _, sdkTG := range staleSDKTGs {
-
-		err := t.targetGroupManager.Delete(ctx, &sdkTG)
-		glog.V(2).Infof("SynthesizeSDKTargetGroups, deleting stale target group %v \n", err)
-
-		if err != nil && !strings.Contains(err.Error(), "TargetGroup is referenced in routing configuration, listeners or rules of service.") {
-			ret_err = true
-		}
-		// continue on even when there is an err
-
+	// basically rebuild everything for the route and see if one of the TGs matches
+	routeStack, err := t.svcBuilder.Build(ctx, route)
+	if err != nil {
+		t.log.Infof("Received error building route model %s", err)
+		return false
 	}
 
-	if ret_err {
-		return errors.New(LATTICE_RETRY)
-	} else {
-		return nil
+	var resTargetGroups []*model.TargetGroup
+	err = routeStack.ListResources(&resTargetGroups)
+	if err != nil {
+		t.log.Infof("Error listing stack target groups %s", err)
+		return false
 	}
 
-}
-
-func (t *targetGroupSynthesizer) isTargetGroupUsedByaHTTPRoute(ctx context.Context, tgName string, httpRoute *gateway_api.HTTPRoute) bool {
-
-	for _, httpRule := range httpRoute.Spec.Rules {
-		for _, httpBackendRef := range httpRule.BackendRefs {
-			if string(*httpBackendRef.BackendObjectReference.Kind) != "Service" {
-				continue
-			}
-			namespace := httpRoute.Namespace
-			if httpBackendRef.BackendObjectReference.Namespace != nil {
-				namespace = string(*httpBackendRef.BackendObjectReference.Namespace)
-			}
-			refTGName := latticestore.TargetGroupName(string(httpBackendRef.BackendObjectReference.Name), namespace)
-
-			if tgName == refTGName {
-				return true
-			}
-
+	var matchFound bool
+	for _, modelTg := range resTargetGroups {
+		match, err := t.targetGroupManager.IsTargetGroupMatch(ctx, modelTg, latticeTg.tgSummary, &tagFields)
+		if err != nil {
+			t.log.Infof("Received error during tg comparison %s", err)
+			continue
 		}
+
+		if match {
+			t.log.Debugf("Route TargetGroup %s (%s) is up to date",
+				*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+
+			matchFound = true
+			break
+		}
+	}
+
+	if !matchFound {
+		t.log.Debugf("Will delete TargetGroup %s (%s) - TG is not up to date",
+			*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+
+		return true // safe to delete
 	}
 
 	return false
 }
 
-func (t *targetGroupSynthesizer) PostSynthesize(ctx context.Context) error {
+func (t *TargetGroupSynthesizer) hasTags(latticeTg tgListOutput) bool {
+	if latticeTg.tags == nil {
+		t.log.Debugf("Ignoring target group %s (%s) because tag fetch was not successful",
+			*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+		return false
+	}
+	return true
+}
+
+func (t *TargetGroupSynthesizer) vpcMatchesConfig(latticeTg tgListOutput) bool {
+	if aws.StringValue(latticeTg.tgSummary.VpcIdentifier) != config.VpcID {
+		t.log.Debugf("Ignoring target group %s (%s) because it is not configured for this VPC",
+			*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+		return false
+	}
+	return true
+}
+
+func (t *TargetGroupSynthesizer) hasExpectedTags(latticeTg tgListOutput, tagFields model.TargetGroupTagFields) bool {
+	if tagFields.K8SClusterName != config.ClusterName {
+		t.log.Debugf("Ignoring target group %s (%s) because it is not configured for this Cluster",
+			*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+		return false
+	}
+
+	if tagFields.K8SSourceType == model.SourceTypeInvalid ||
+		tagFields.K8SServiceName == "" || tagFields.K8SServiceNamespace == "" {
+
+		t.log.Infof("Ignoring target group %s (%s) as one or more required tags are missing",
+			*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+		return false
+	}
+
+	// route-based TGs should have the additional route keys
+	if tagFields.IsSourceTypeRoute() && (tagFields.K8SRouteName == "" || tagFields.K8SRouteNamespace == "") {
+		t.log.Infof("Ignoring route-based target group %s (%s) as one or more required tags are missing",
+			*latticeTg.tgSummary.Arn, *latticeTg.tgSummary.Name)
+		return false
+	}
+
+	return true
+}
+
+func (t *TargetGroupSynthesizer) PostSynthesize(ctx context.Context) error {
 	// nothing to do here
 	return nil
-}
-
-func (t *targetGroupSynthesizer) SynthesizeTriggeredTargetGroupsCreation(ctx context.Context) error {
-	var resTargetGroups []*latticemodel.TargetGroup
-	var returnErr = false
-	t.stack.ListResources(&resTargetGroups)
-	glog.V(6).Infof("SynthesizeTriggeredTargetGroupsCreation TargetGroups: [%v]\n", resTargetGroups)
-	for _, resTargetGroup := range resTargetGroups {
-		if resTargetGroup.Spec.IsDeleted {
-			glog.V(6).Infof("In the SynthesizeTriggeredTargetGroupsCreation(), we only handle TG Creation request and skip any deletion request [%v] \n", resTargetGroup)
-			continue
-		}
-		if resTargetGroup.Spec.Config.IsServiceImport {
-			tgStatus, err := t.targetGroupManager.Get(ctx, resTargetGroup)
-			if err != nil {
-				glog.V(6).Infof("Error on t.targetGroupManager.Get for %v err %v\n", resTargetGroup, err)
-				returnErr = true
-				continue
-			}
-			// for serviceimport, the httproutename is ""
-			t.latticeDataStore.AddTargetGroup(resTargetGroup.Spec.Name,
-				resTargetGroup.Spec.Config.VpcID, tgStatus.TargetGroupARN, tgStatus.TargetGroupID,
-				resTargetGroup.Spec.Config.IsServiceImport, "")
-			glog.V(6).Infof("targetGroup Synthesized successfully for %s: %v\n", resTargetGroup.Spec.Name, tgStatus)
-		} else { // handle TargetGroup creation request that triggered by httproute with backendref k8sService creation or serviceExport creation
-			resTargetGroup.Spec.Config.VpcID = config.VpcID
-			tgStatus, err := t.targetGroupManager.Create(ctx, resTargetGroup)
-			if err != nil {
-				glog.V(6).Infof("Error on t.targetGroupManager.Create for %v err %v\n", resTargetGroup, err)
-				returnErr = true
-				continue
-			}
-			//In the ModelBuildTask, it should already add a tg entry in the latticeDataStore,
-			//in here, only UPDATE the entry with tgStatus.TargetGroupARN and tgStatus.TargetGroupID
-			t.latticeDataStore.AddTargetGroup(resTargetGroup.Spec.Name,
-				resTargetGroup.Spec.Config.VpcID, tgStatus.TargetGroupARN,
-				tgStatus.TargetGroupID, resTargetGroup.Spec.Config.IsServiceImport,
-				resTargetGroup.Spec.Config.K8SHTTPRouteName)
-			glog.V(6).Infof("targetGroup Synthesized successfully for %v: %v\n", resTargetGroup.Spec, tgStatus)
-		}
-	}
-	glog.V(6).Infof("Done -- SynthesizeTriggeredTargetGroupsCreation %v\n", resTargetGroups)
-	if returnErr {
-		return errors.New(LATTICE_RETRY)
-	} else {
-		return nil
-	}
-
-}
-
-func (t *targetGroupSynthesizer) SynthesizeTriggeredTargetGroupsDeletion(ctx context.Context) error {
-	var resTargetGroups []*latticemodel.TargetGroup
-	var returnErr = false
-	t.stack.ListResources(&resTargetGroups)
-	glog.V(2).Infof("SynthesizeTriggeredTargetGroupsDeletion: TargetGroups ==[%v]\n", resTargetGroups)
-	for _, resTargetGroup := range resTargetGroups {
-		if !resTargetGroup.Spec.IsDeleted {
-			glog.V(6).Infof("SynthesizeTriggeredTargetGroupsDeletion should ignore target group creation request for tg: [%v]\n", resTargetGroup)
-			continue
-		}
-		if resTargetGroup.Spec.Config.IsServiceImport {
-			// For delete TargetGroup request triggered by service import, we just delete the tg in the datastore
-			t.latticeDataStore.DelTargetGroup(resTargetGroup.Spec.Name, resTargetGroup.Spec.Config.K8SHTTPRouteName, resTargetGroup.Spec.Config.IsServiceImport)
-		} else {
-			// For delete TargetGroup request triggered by k8s service, invoke vpc lattice api to delete it, if success, delete the tg in the datastore as well
-			err := t.targetGroupManager.Delete(ctx, resTargetGroup)
-			glog.V(6).Infof("err := t.targetGroupManager.Delete(ctx, resTargetGroup) err: %v\n", err)
-			if err == nil {
-				glog.V(6).Infof("Delete Target Group in SynthesizeTriggeredTargetGroupsDeletion: successfully deleted target group %v\n", resTargetGroup)
-				t.latticeDataStore.DelTargetGroup(resTargetGroup.Spec.Name, resTargetGroup.Spec.Config.K8SHTTPRouteName, resTargetGroup.Spec.Config.IsServiceImport)
-			} else {
-				glog.V(6).Infof("Delete Target Group in SynthesizeTriggeredTargetGroupsDeletion: failed to delete target group %v, err %v \n", resTargetGroup, err)
-				returnErr = true
-			}
-		}
-	}
-	if returnErr {
-		return errors.New(LATTICE_RETRY)
-	} else {
-		return nil
-	}
 }

@@ -1,5 +1,4 @@
 # Keep this until the APIs upstreamed
-scripts/aws_sdk_model_override/aws-sdk-go
 coverage.out
 deploy.yaml
 
@@ -11,3 +10,12 @@ go.work*
 
 # envFile from load_env_variables.sh
 **/envFile
+
+# IDE files/directories
+.idea/
+
+# gomock generated prog.go
+pkg/aws/services/gomock_reflect_*
+
+# Image build tarballed bundles
+*.tgz
